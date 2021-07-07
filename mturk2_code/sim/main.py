@@ -49,14 +49,14 @@ class GenModel:
         return p_r_x
 
 
-    def integrator(self, reward_prob: np.ndarray) -> Tuple[float, float]:
+    def integrator(self, reward_prob: np.ndarray) -> np.ndarray:
         """
         optimally integrate the reward estimates from individual cues to estimate reward.
         :param reward_probs: From each modality the probabilities for each reward (m x r)
-        :return tuple of combined reward probabilities:
+        :return integrated probabilities of each reward:
         """
-        # TODO: Implement this as rewards weighted by probs (can we just softmax the sum of the distributions? )
-        pass
+        combined = np.prod(reward_prob, axis=0)
+        return np.exp(combined) / np.exp(np.sum(combined))
 
 
 class SpaceSampler:
