@@ -14,6 +14,7 @@ import pandas as pd
 SUBJECT_NAMES = {'Buzz', 'Tina', 'Yuri', 'Sally'}
 VERSION_NOTE = "V2. Added graphic comparing performance across subjects (see attached) and some more stats."
 
+
 class SessionData:
     """
     an object to hold the data from one session
@@ -31,7 +32,6 @@ class SessionData:
         self.reward_map = np.array(self.data_dict['RewardStage'], dtype=int)
         self.choices = np.array(self.data_dict['Response'], dtype=int)
         self.trial_time_milliseconds = self.data_dict['StartTime']
-
 
     def get_priors(self):
         """
@@ -65,20 +65,20 @@ class SessionData:
 def analyze_session(filename, data_dict):
     """
     Initialize data analysis and collect results.
-    Return text descripters at index 0, with further indices being data for plotting
-    Store any historical data to csv.
+    Return a dictionary containing computed statistics
     """
     data = SessionData(filename, data_dict)
     observed_r_dist = data.get_real_reward_dist()
     prior_r_dist = data.get_priors()
     analysis = {'observed_reward_dist': observed_r_dist,
                 'prior_reward_dist': prior_r_dist * len(data),
-                'percent_diff_chance': ((observed_r_dist - (prior_r_dist  * len(data))) / (prior_r_dist * len(data))),
+                'percent_diff_chance': ((observed_r_dist - (prior_r_dist * len(data))) / (prior_r_dist * len(data))),
                 'percent_best_reward': data.get_max_reward_prob()}
     return analysis, data
 
+
 def dropbox_connector(access_token: str):
-    with dropbox.Dropbox(oauth2_access_token='rs2UxmS43BwAAAAAAAAAAXfNzkhWFgemApwtub7zhgWix78XTKrNQCQnyFOgE7zt') as dbx:
+    with dropbox.Dropbox(oauth2_access_token=access_token) as dbx:
         try:
             print(dbx.users_get_current_account())
         except Exception:
@@ -88,6 +88,10 @@ def dropbox_connector(access_token: str):
 
 
 def get_session_data(dbx, date: datetime.date) -> List[Tuple[str, Dict]]:
+    """
+    Scans dropbox for the specified date's data files, and parses them using pythons json module.
+    Returns a list of dictionaries of data.
+    """
     name_set = copy.deepcopy(SUBJECT_NAMES)
     subject_data = []
     res = dbx.files_list_folder('/Apps/ShapeColorSpace/MonkData/')
@@ -117,7 +121,12 @@ def get_session_data(dbx, date: datetime.date) -> List[Tuple[str, Dict]]:
     print('Loaded File Data Successfully')
     return subject_data
 
+
 def handler(subject_data: list):
+    """
+    Collects analysis, generates test output, and plots analysis.
+    returns output text, and saves figures to the saved_data/figures directory
+    """
     out = ''
     colors = ['red', 'green', 'blue', 'purple']
     for i, s in enumerate(subject_data):
@@ -127,10 +136,13 @@ def handler(subject_data: list):
         out += "Session Date: " + str(data.date) + '\n\n'
         out += "Trials Completed: " + str(len(data)) + '\n\n'
         out += "Session Runtime: " + str((data.trial_time_milliseconds[-1] / 1e3) / (60 * 60)) + " hours" + '\n\n'
-        out += "Frequency Subject Received Each Reward Type (Worst to Best): " + str(list(analysis['observed_reward_dist'])) + '\n\n'
-        out += "Chance Frequency of Each Reward Type (Worst to Best): " + str(list(analysis['prior_reward_dist'])) + '\n\n'
+        out += "Frequency Subject Received Each Reward Type (Worst to Best): " + str(
+            list(analysis['observed_reward_dist'])) + '\n\n'
+        out += "Chance Frequency of Each Reward Type (Worst to Best): " + str(
+            list(analysis['prior_reward_dist'])) + '\n\n'
         out += "Percent Difference of Observed vs Chance: " + str(list(analysis['percent_diff_chance'] * 100)) + "\n\n"
-        out += "Observed Portion of Trials Subject Chose Best Available Reward: " + str(analysis['percent_best_reward']) + '\n\n'
+        out += "Observed Portion of Trials Subject Chose Best Available Reward: " + str(
+            analysis['percent_best_reward']) + '\n\n'
         plt.plot(np.arange(4), analysis['percent_diff_chance'].reshape(-1),
                  color=colors[i],
                  label=data.monkey_name,
@@ -145,8 +157,12 @@ def handler(subject_data: list):
     return out
 
 
-
-def communicate(psswd, ptext, date):
+def communicate(psswd, ptext, date, debug=False):
+    """
+    Constructs and sends an email to the default list of recipients.
+    If debug is true, only sends to spencer.
+    Attaches generated plots to email body.
+    """
     import smtplib
     import ssl
     from email.mime.text import MIMEText
@@ -154,7 +170,14 @@ def communicate(psswd, ptext, date):
     from email.mime.base import MIMEBase
     from email.mime.multipart import MIMEMultipart
 
-    to = ["spencer.loggia@nih.gov"]
+    if debug:
+        to = ["spencer.loggia@nih.gov"]
+    else:
+        to = ["spencer.loggia@nih.gov",
+              "bevil.conway@nih.gov",
+              "tunktunk@icloud.com",
+              "stuart.duffield@nih.gov",
+              "shriya.awasthi@nih.gov"]
     img_name = str(date) + '_performance_vs_chance_mturk2.png'
     with open('../saved_data/figures/' + img_name, 'rb') as attach:
         part = MIMEBase('application', 'octet-stream')
@@ -180,11 +203,11 @@ def communicate(psswd, ptext, date):
         server.login("mturk2mailserverSL@gmail.com", psswd)
         server.sendmail(from_addr="mturk2mailserverSL@gmail.com",
                         to_addrs=to,
-                        msg=etext,)
+                        msg=etext, )
         print("Report Email Delivered Successfully.")
 
 
-if __name__=='__main__':
+if __name__ == '__main__':
     try:
         date = datetime.date(int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]))
         psswd = sys.argv[4]
@@ -195,8 +218,8 @@ if __name__=='__main__':
         psswd = sys.argv[1]
         dbx_token = sys.argv[2]
         mode = sys.argv[3]
-    if mode not in ['--prod', '--test']:
-        raise ValueError('Mode must be --prod or --test.')
+    if mode not in ['--prod', '--test', '--test_mail']:
+        raise ValueError('Mode must be --prod, --test, or --test_mail.')
     dbx = dropbox_connector(dbx_token)
     subject_data = get_session_data(dbx, date)
     output = 'MTurk 2 Progress Report for ' + str(date) + '\n'
@@ -205,4 +228,6 @@ if __name__=='__main__':
     output += handler(subject_data)
     print(output)
     if mode == '--prod':
-        communicate(psswd, output, date)
+        communicate(psswd, output, date, debug=False)
+    if mode == '--test_mail':
+        communicate(psswd, output, date, debug=True)
