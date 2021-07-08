@@ -12,7 +12,7 @@ from matplotlib import pyplot as plt
 import pandas as pd
 
 SUBJECT_NAMES = {'Buzz', 'Tina', 'Yuri', 'Sally'}
-VERSION_NOTE = "The above is preliminary analysis, more detailed / interesting information will be added."
+VERSION_NOTE = "V2. Added graphic comparing performance across subjects (see attached) and some more stats."
 
 class SessionData:
     """
@@ -146,18 +146,41 @@ def handler(subject_data: list):
 
 
 
-def communicate(psswd, message):
+def communicate(psswd, ptext, date):
     import smtplib
     import ssl
+    from email.mime.text import MIMEText
+    from email import encoders
+    from email.mime.base import MIMEBase
+    from email.mime.multipart import MIMEMultipart
+
+    to = ["spencer.loggia@nih.gov"]
+    img_name = str(date) + '_performance_vs_chance_mturk2.png'
+    with open('../saved_data/figures/' + img_name, 'rb') as attach:
+        part = MIMEBase('application', 'octet-stream')
+        part.set_payload(attach.read())
+    encoders.encode_base64(part)
+    part.add_header(
+        "Content-Disposition",
+        f"attachment; filename= {img_name}"
+    )
+    ptext = ptext + '\n\n' + VERSION_NOTE
+
+    m_message = MIMEMultipart("alternative")
+    m_message['Subject'] = ptext.partition('\n')[0]
+    m_message['From'] = "mturk2mailserverSL@gmail.com"
+    m_message['To'] = str(to)
+    m_message.attach(part)
+    m_message.attach(MIMEText(ptext, "plain"))
+    etext = m_message.as_string()
+
     port = 465
     context = ssl.create_default_context()
-    message = 'Subject:' + message + '\n\n' + VERSION_NOTE
     with smtplib.SMTP_SSL("smtp.gmail.com", port, context=context) as server:
         server.login("mturk2mailserverSL@gmail.com", psswd)
         server.sendmail(from_addr="mturk2mailserverSL@gmail.com",
-                        to_addrs=["spencer.loggia@nih.gov",
-                                  ],
-                        msg=message,)
+                        to_addrs=to,
+                        msg=etext,)
         print("Report Email Delivered Successfully.")
 
 
@@ -182,4 +205,4 @@ if __name__=='__main__':
     output += handler(subject_data)
     print(output)
     if mode == '--prod':
-        communicate(psswd, output)
+        communicate(psswd, output, date)
