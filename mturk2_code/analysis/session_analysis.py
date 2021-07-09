@@ -10,8 +10,12 @@ import datetime
 import copy
 from matplotlib import pyplot as plt
 import pandas as pd
+from io import BytesIO, StringIO
+from multiprocessing import Pool
+
 
 SUBJECT_NAMES = {'Buzz', 'Tina', 'Yuri', 'Sally'}
+HISTORICAL_FEATS = ['date', 'subject_name', 'num_trials', 'duration(last-first)', 'r0_percent_diff_chance', 'r1_percent_diff_chance', 'r2_percent_diff_chance', 'r3_percent_diff_chance', 'prob_best_reward', 'prob_worst_reward']
 VERSION_NOTE = "V2. Added graphic comparing performance across subjects (see attached) and some more stats."
 
 
@@ -58,6 +62,14 @@ class SessionData:
         num_best = np.count_nonzero(best_choice == np.choose(self.choices, self.reward_map.T))
         return num_best / len(self)
 
+    def get_min_reward_prob(self):
+        """
+        get the observed probability that a monkey picked the worst reward on a trial
+        """
+        best_choice = np.min(self.reward_map, axis=1)
+        num_best = np.count_nonzero(best_choice == np.choose(self.choices, self.reward_map.T))
+        return num_best / len(self)
+
     def __len__(self):
         return len(self.data_dict['StartTime'])
 
@@ -73,7 +85,8 @@ def analyze_session(filename, data_dict):
     analysis = {'observed_reward_dist': observed_r_dist,
                 'prior_reward_dist': prior_r_dist * len(data),
                 'percent_diff_chance': ((observed_r_dist - (prior_r_dist * len(data))) / (prior_r_dist * len(data))),
-                'percent_best_reward': data.get_max_reward_prob()}
+                'percent_best_reward': data.get_max_reward_prob(),
+                'percent_worst_reward': data.get_min_reward_prob()}
     return analysis, data
 
 
@@ -122,20 +135,64 @@ def get_session_data(dbx, date: datetime.date) -> List[Tuple[str, Dict]]:
     return subject_data
 
 
-def handler(subject_data: list):
+def get_historical_data(dbx) -> Dict[str, pd.DataFrame]:
+    historical_data = {}
+    for name in SUBJECT_NAMES:
+        try:
+            metadata, fdata = dbx.files_download(path='/Apps/ShapeColorSpace/MonkData/mturk2_' + name + '_history.csv')
+            historical_data[name] = pd.read_csv(BytesIO(fdata.content))
+        except:
+            historical_data[name] = pd.DataFrame(columns=HISTORICAL_FEATS).set_index('date')
+    return historical_data
+
+
+def save_historical_data(dbx, historical_data: pd.DataFrame):
+    """
+    write new historical data to dropbox
+    """
+    name = str(historical_data['subject_name'].iloc[0])
+    path = '/Apps/ShapeColorSpace/MonkData/mturk2_' + name + '_history.csv'
+    try:
+        dbx.files_upload(bytes(historical_data.to_csv(), encoding='utf-8'),
+                         path=path,
+                         mute=True,
+                         mode=dropbox.files.WriteMode('overwrite'))
+    except Exception:
+        raise RuntimeError()
+    return
+
+
+def handler(subject_data: list, historical_data: Dict[str, pd.DataFrame]):
     """
     Collects analysis, generates test output, and plots analysis.
     returns output text, and saves figures to the saved_data/figures directory
     """
     out = ''
     colors = ['red', 'green', 'blue', 'purple']
+    fig1, ax1 = plt.subplots()
+    fig2, ax2 = plt.subplots()
     for i, s in enumerate(subject_data):
         analysis, data = analyze_session(s[0], s[1])
+        sess_duration = (data.trial_time_milliseconds[-1] / 1e3) / (60 * 60)
+        new_row = pd.DataFrame.from_dict({
+            data.date:
+                [data.monkey_name,
+                len(data),
+                sess_duration,
+                float(analysis['percent_diff_chance'][0]),
+                float(analysis['percent_diff_chance'][1]),
+                (analysis['percent_diff_chance'][2]),
+                float(analysis['percent_diff_chance'][3]),
+                float(analysis['percent_best_reward']),
+                float(analysis['percent_worst_reward'])
+                ]},
+            orient='index', columns=HISTORICAL_FEATS[1:])
+        historical_data[data.monkey_name] = pd.concat([historical_data[data.monkey_name], new_row], axis=0)
         out += '---------------------------------------\n'
         out += "Subject: " + str(data.monkey_name) + '\n\n'
         out += "Session Date: " + str(data.date) + '\n\n'
         out += "Trials Completed: " + str(len(data)) + '\n\n'
-        out += "Session Runtime: " + str((data.trial_time_milliseconds[-1] / 1e3) / (60 * 60)) + " hours" + '\n\n'
+        out += "Session Runtime: " + str(sess_duration) + " hours" + '\n\n'
         out += "Frequency Subject Received Each Reward Type (Worst to Best): " + str(
             list(analysis['observed_reward_dist'])) + '\n\n'
         out += "Chance Frequency of Each Reward Type (Worst to Best): " + str(
@@ -143,18 +200,29 @@ def handler(subject_data: list):
         out += "Percent Difference of Observed vs Chance: " + str(list(analysis['percent_diff_chance'] * 100)) + "\n\n"
         out += "Observed Portion of Trials Subject Chose Best Available Reward: " + str(
             analysis['percent_best_reward']) + '\n\n'
-        plt.plot(np.arange(4), analysis['percent_diff_chance'].reshape(-1),
+        ax1.plot(np.arange(4), analysis['percent_diff_chance'].reshape(-1),
                  color=colors[i],
                  label=data.monkey_name,
                  linestyle='--',
                  marker='o')
-        plt.xlabel("Reward Type (Worst to Best)")
-        plt.ylabel("Reward Frequency Percent Difference From Chance ")
-        plt.title("MTurk2 Subject Performance " + str(data.date))
-        plt.legend()
-    plt.suptitle('')
-    plt.savefig('../saved_data/figures/' + str(data.date) + '_performance_vs_chance_mturk2.png')
-    return out
+        ax1.set_xticks([0, 1, 2, 3])
+        ax1.set_xlabel("Reward Type (Worst to Best)")
+        ax1.set_ylabel("Reward Frequency Percent Difference From Chance ")
+        ax1.set_title("MTurk2 Subject Performance " + str(data.date))
+        fig1.legend()
+        ax2.plot([str(ind) for ind in historical_data[data.monkey_name].index], historical_data[data.monkey_name]['prob_best_reward'],
+                 color=colors[i],
+                 label=data.monkey_name,
+                 linestyle='--',
+                 marker='o')
+        ax2.set_xlabel("Session Date")
+        ax2.set_ylabel("Probability of Choosing Best Reward on Each Trial")
+        ax2.set_title("MTurk2 Historical Performance " + str(data.date))
+        fig2.legend()
+    if len(subject_data) > 0:
+        fig1.savefig('../saved_data/figures/' + str(data.date) + '_performance_vs_chance_mturk2.png')
+        fig2.savefig('../saved_data/figures/' + str(data.date) + '_historical_mturk2.png')
+    return out, historical_data
 
 
 def communicate(psswd, ptext, date, debug=False):
@@ -174,6 +242,7 @@ def communicate(psswd, ptext, date, debug=False):
         to = ["spencer.loggia@nih.gov"]
     else:
         to = ["spencer.loggia@nih.gov",
+              "sl@spencerloggia.com",
               "bevil.conway@nih.gov",
               "tunktunk@icloud.com",
               "stuart.duffield@nih.gov",
@@ -214,7 +283,7 @@ if __name__ == '__main__':
         dbx_token = sys.argv[5]
         mode = sys.argv[6]
     except (IndexError, ValueError):
-        date = datetime.date.today()
+        date = datetime.date.today() - datetime.timedelta(days=1)
         psswd = sys.argv[1]
         dbx_token = sys.argv[2]
         mode = sys.argv[3]
@@ -225,7 +294,13 @@ if __name__ == '__main__':
     output = 'MTurk 2 Progress Report for ' + str(date) + '\n'
     if len(subject_data) == 0:
         output += 'MTurk2 boxes were not setup today.'
-    output += handler(subject_data)
+
+    historical = get_historical_data(dbx)
+    res = handler(subject_data, historical)
+    output += res[0]
+    hist = res[1]
+    with Pool(len(historical)) as p:
+        p.starmap(save_historical_data, [(dbx, h) for h in historical.values()])
     print(output)
     if mode == '--prod':
         communicate(psswd, output, date, debug=False)
