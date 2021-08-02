@@ -16,7 +16,7 @@ from multiprocessing import Pool
 
 SUBJECT_NAMES = {'Buzz', 'Tina', 'Yuri', 'Sally'}
 HISTORICAL_FEATS = ['date', 'subject_name', 'num_trials', 'duration(last-first)', 'r0_percent_diff_chance', 'r1_percent_diff_chance', 'r2_percent_diff_chance', 'r3_percent_diff_chance', 'prob_best_reward', 'prob_worst_reward']
-VERSION_NOTE = "V2. Added graphic comparing performance across subjects (see attached) and some more stats."
+VERSION_NOTE = "V3. Added performance history (see second  attached) and some more stats."
 
 
 class SessionData:
@@ -142,7 +142,7 @@ def get_historical_data(dbx) -> Dict[str, pd.DataFrame]:
             metadata, fdata = dbx.files_download(path='/Apps/ShapeColorSpace/MonkData/mturk2_' + name + '_history.csv')
             historical_data[name] = pd.read_csv(BytesIO(fdata.content))
         except:
-            historical_data[name] = pd.DataFrame(columns=HISTORICAL_FEATS).set_index('date')
+            historical_data[name] = pd.DataFrame(columns=HISTORICAL_FEATS)
     return historical_data
 
 
@@ -174,9 +174,9 @@ def handler(subject_data: list, historical_data: Dict[str, pd.DataFrame]):
     for i, s in enumerate(subject_data):
         analysis, data = analyze_session(s[0], s[1])
         sess_duration = (data.trial_time_milliseconds[-1] / 1e3) / (60 * 60)
-        new_row = pd.DataFrame.from_dict({
-            data.date:
-                [data.monkey_name,
+        new_row = pd.DataFrame.from_dict(
+            {9999999: [data.date,
+                data.monkey_name,
                 len(data),
                 sess_duration,
                 float(analysis['percent_diff_chance'][0]),
@@ -185,9 +185,8 @@ def handler(subject_data: list, historical_data: Dict[str, pd.DataFrame]):
                 float(analysis['percent_diff_chance'][3]),
                 float(analysis['percent_best_reward']),
                 float(analysis['percent_worst_reward'])
-                ]},
-            orient='index', columns=HISTORICAL_FEATS[1:])
-        historical_data[data.monkey_name] = pd.concat([historical_data[data.monkey_name], new_row], axis=0)
+                ]}, orient='index', columns=HISTORICAL_FEATS)
+        historical_data[data.monkey_name] = pd.concat([historical_data[data.monkey_name], new_row], ignore_index=True)
         out += '---------------------------------------\n'
         out += "Subject: " + str(data.monkey_name) + '\n\n'
         out += "Session Date: " + str(data.date) + '\n\n'
@@ -210,7 +209,7 @@ def handler(subject_data: list, historical_data: Dict[str, pd.DataFrame]):
         ax1.set_ylabel("Reward Frequency Percent Difference From Chance ")
         ax1.set_title("MTurk2 Subject Performance " + str(data.date))
         fig1.legend()
-        ax2.plot([str(ind) for ind in historical_data[data.monkey_name].index], historical_data[data.monkey_name]['prob_best_reward'],
+        ax2.plot([str(ind) for ind in historical_data[data.monkey_name]['date']], historical_data[data.monkey_name]['prob_best_reward'],
                  color=colors[i],
                  label=data.monkey_name,
                  linestyle='--',
@@ -247,6 +246,14 @@ def communicate(psswd, ptext, date, debug=False):
               "tunktunk@icloud.com",
               "stuart.duffield@nih.gov",
               "shriya.awasthi@nih.gov"]
+
+    ptext = ptext + '\n\n' + VERSION_NOTE
+
+    m_message = MIMEMultipart("alternative")
+    m_message['Subject'] = ptext.partition('\n')[0]
+    m_message['From'] = "mturk2mailserverSL@gmail.com"
+    m_message['To'] = str(to)
+
     img_name = str(date) + '_performance_vs_chance_mturk2.png'
     with open('../saved_data/figures/' + img_name, 'rb') as attach:
         part = MIMEBase('application', 'octet-stream')
@@ -256,13 +263,19 @@ def communicate(psswd, ptext, date, debug=False):
         "Content-Disposition",
         f"attachment; filename= {img_name}"
     )
-    ptext = ptext + '\n\n' + VERSION_NOTE
-
-    m_message = MIMEMultipart("alternative")
-    m_message['Subject'] = ptext.partition('\n')[0]
-    m_message['From'] = "mturk2mailserverSL@gmail.com"
-    m_message['To'] = str(to)
     m_message.attach(part)
+
+    img_name = str(date) + '_historical_mturk2.png'
+    with open('../saved_data/figures/' + img_name, 'rb') as attach:
+        part = MIMEBase('application', 'octet-stream')
+        part.set_payload(attach.read())
+    encoders.encode_base64(part)
+    part.add_header(
+        "Content-Disposition",
+        f"attachment; filename= {img_name}"
+    )
+    m_message.attach(part)
+
     m_message.attach(MIMEText(ptext, "plain"))
     etext = m_message.as_string()
 
@@ -287,7 +300,7 @@ if __name__ == '__main__':
         psswd = sys.argv[1]
         dbx_token = sys.argv[2]
         mode = sys.argv[3]
-    if mode not in ['--prod', '--test', '--test_mail']:
+    if mode not in ['--prod', '--test', '--test_mail', '--test_save_hist']:
         raise ValueError('Mode must be --prod, --test, or --test_mail.')
     dbx = dropbox_connector(dbx_token)
     subject_data = get_session_data(dbx, date)
@@ -299,8 +312,9 @@ if __name__ == '__main__':
     res = handler(subject_data, historical)
     output += res[0]
     hist = res[1]
-    with Pool(len(historical)) as p:
-        p.starmap(save_historical_data, [(dbx, h) for h in historical.values()])
+    if mode in ['--prod', '--test_save_hist']:
+        with Pool(len(historical)) as p:
+            p.starmap(save_historical_data, [(dbx, h) for h in historical.values()])
     print(output)
     if mode == '--prod':
         communicate(psswd, output, date, debug=False)

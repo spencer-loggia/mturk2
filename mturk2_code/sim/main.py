@@ -1,6 +1,6 @@
 # AUTHOR SPENCER LOGGIA
 # INIT DATE 06/30/2021
-from typing import Tuple
+from typing import Tuple, List
 
 import numpy as np
 from scipy import stats
@@ -35,7 +35,6 @@ class GenModel:
 
     def predict_trial(self, x: np.ndarray, modality: int):
         """
-
         :param x: batch x shape dim
         :return: posterior probabilities of each reward value based on this modality
         """
@@ -48,7 +47,6 @@ class GenModel:
         p_r_x = (p_x_r * p_r) / p_x
         return p_r_x
 
-
     def integrator(self, reward_prob: np.ndarray) -> np.ndarray:
         """
         optimally integrate the reward estimates from individual cues to estimate reward.
@@ -59,24 +57,51 @@ class GenModel:
         return np.exp(combined) / np.exp(np.sum(combined))
 
 
-class SpaceSampler:
-    #
-    def __init__(self, seed=None):
-        pass
-
-    def generate_samples(self):
-        """
-        draw samples from the space and return expected reward and variance.
-        :return:
-        """
-        yield
-
 class StimuliSpace:
     """
-    A space contains n dim vectors of object ids, coordinates, and gaussian mean coordinates, gaussian variance, and
+    A space contains n dim vectors of object coordinates, and gaussian mean coordinates, gaussian variance, and
     associated reward value
     """
-    def __init__(self, ):
+    def __init__(self, coordinates, means, var, value):
+        self.coordinates = coordinates
+        self.means = means
+        self.var = var
+        self.values = value
+
+    def assign_reward(self, coord):
+        probs = np.zeros(len(self.means))
+        for i in range(len(self.means)):
+            p_x_r = stats.multivariate_normal.cdf(coord, mu=self.means[i], cov=self.var[i])
+            probs[i] = p_x_r
+        exp_probs = np.exp(probs)
+        probs = exp_probs / sum(exp_probs)
+        reward = np.random.choice(np.arange(4), p=probs)
+        return reward
+
+    def sample(self):
+        idx = np.random.randint(len(self.coordinates))
+        yield idx, self.assign_reward(self.coordinates[idx])
+
+
+class Agent:
+
+    def __init__(self, num_iter, spaces: List[StimuliSpace], concurrent_choices, num_rewards, space_dims):
+        self.spaces = spaces
+        self.num_iter = num_iter
+        self.concurrent = concurrent_choices
+        self.model = GenModel(rewards=num_rewards, modalities=len(spaces), space_dims=space_dims)
+        self.available_rewards = np.zeros(num_rewards)
+        for i in range(self.concurrent):
+
+            for space in spaces:
+                item = space.sample()
+
+
+
+
+    def simulate(self):
+        for i in range(self.concurent):
+
 
 
 def simulate(trials=100):
