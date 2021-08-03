@@ -54,6 +54,21 @@ class SessionData:
         freq = np.unique(dist, return_counts=True)[1]
         return freq
 
+    def reward_choice_frequency_marginal(self, axis: str):
+        """
+        return the vector of the frequency that an item presented was chosen best by subject
+        param: axis:str exists in {'shape', 'color'}
+        returns: np.ndarray (1xn)
+        """
+        raise NotImplemented
+
+    def choice_loc_marginal(self):
+        """
+        return the frequency vector at which each screen location is chosen
+        return: np.ndarray (1xd)
+        """
+        raise NotImplemented
+
     def get_max_reward_prob(self):
         """
         get the observed probability that a monkey picked the best reward on a trial
