@@ -186,8 +186,10 @@ def handler(subject_data: list, historical_data: Dict[str, pd.DataFrame]):
     colors = ['red', 'green', 'blue', 'purple']
     fig1, ax1 = plt.subplots()
     fig2, ax2 = plt.subplots()
-    for i, s in enumerate(subject_data):
+    exp_name_set = copy.deepcopy(SUBJECT_NAMES)
+    for i, s in enumerate(sorted(subject_data)):
         analysis, data = analyze_session(s[0], s[1])
+        exp_name_set.remove(data.monkey_name)
         sess_duration = (data.trial_time_milliseconds[-1] / 1e3) / (60 * 60)
         new_row = pd.DataFrame.from_dict(
             {9999999: [data.date,
@@ -233,9 +235,13 @@ def handler(subject_data: list, historical_data: Dict[str, pd.DataFrame]):
         ax2.set_ylabel("Probability of Choosing Best Reward on Each Trial")
         ax2.set_title("MTurk2 Historical Performance " + str(data.date))
         fig2.legend()
+    for unused_name in exp_name_set:
+        new_row = pd.Series()
+        new_row['date'] = str(date)
+        historical_data[unused_name] = historical_data[unused_name].append(new_row, ignore_index=True)
     if len(subject_data) > 0:
-        fig1.savefig('../saved_data/figures/' + str(data.date) + '_performance_vs_chance_mturk2.png')
-        fig2.savefig('../saved_data/figures/' + str(data.date) + '_historical_mturk2.png')
+        fig1.savefig('../saved_data/figures/' + str(date) + '_performance_vs_chance_mturk2.png')
+        fig2.savefig('../saved_data/figures/' + str(date) + '_historical_mturk2.png')
     return out, historical_data
 
 
