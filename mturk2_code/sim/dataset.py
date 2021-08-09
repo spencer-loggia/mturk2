@@ -23,8 +23,8 @@ class ColorShapeData(Dataset):
         shapes = Image.open(shape_data_path)
         shapes = np.array(shapes).reshape((400, 36, 400, 3))
         self.shapes = np.transpose(shapes, (1, 0, 2, 3))
-        self.rewards = read_csv(reward_assignment_path).values.reshape(-1)
-        exp_prob = np.exp(read_csv(prob_stim_path).values.reshape(-1))
+        self.rewards = read_csv(reward_assignment_path).iloc[:, 0].values.reshape(-1)
+        exp_prob = np.exp(read_csv(prob_stim_path).iloc[:, 0].values.reshape(-1))
         self.freq = exp_prob / np.sum(exp_prob)
         self.num_samples = num_samples
         if color_spec_path is None:
@@ -34,7 +34,7 @@ class ColorShapeData(Dataset):
             self.colors = np.array(cspace.colors)[idx] * 255
         else:
             self.colors = np.array(read_csv(color_spec_path).values, dtype=float) * 255
-        self.sample_idxs = np.random.choice(np.arange(len(self)-1), size=self.num_samples, p=self.freq)
+        self.sample_idxs = np.random.choice(np.arange(len(self)), size=self.num_samples, p=self.freq)
         self.head = 0
         print('loaded data')
 

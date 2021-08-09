@@ -11,7 +11,7 @@ from matplotlib import pyplot as plt
 class Agent:
 
     def __init__(self, policy: nn.Module,
-                 lr_init: float = .0001, lr_decay_iter: int = 2000, lr_decay_scale: float = .5,
+                 lr_init: float = .001, lr_decay_iter: int = 2000, lr_decay_scale: float = .5,
                  eplison: float = .95, epsilon_decay_pattern: str = 'linear', epsilon_final: float = 0.,
                  gamma_temporal_decay: float = .9):
         self.brain = policy
@@ -48,7 +48,7 @@ class Agent:
             pred_rewards = self.brain(stimuli).reshape(-1, 4)
             count += 40
             gt_rewards = torch.tensor(gt_rewards, dtype=torch.int64)
-            l = loss(pred_rewards,gt_rewards)
+            l = loss(pred_rewards, gt_rewards)
             sliding_hist.append(l.item())
             reward_hist.append(torch.count_nonzero(torch.argmax(pred_rewards, dim=1) == gt_rewards) / len(gt_rewards))
             if (count) % 120 == 0:

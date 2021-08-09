@@ -13,10 +13,15 @@ import pandas as pd
 from io import BytesIO, StringIO
 from multiprocessing import Pool
 
+from mturk2_code.sim import Agent, ColorShapeData
+from mturk2_code.connect_task import present_previous_trials
 
 SUBJECT_NAMES = {'Buzz', 'Tina', 'Yuri', 'Sally'}
-HISTORICAL_FEATS = ['date', 'subject_name', 'num_trials', 'duration(last-first)', 'r0_percent_diff_chance', 'r1_percent_diff_chance', 'r2_percent_diff_chance', 'r3_percent_diff_chance', 'prob_best_reward', 'prob_worst_reward']
-VERSION_NOTE = "V3. Added performance history (see second  attached) and some more stats."
+HISTORICAL_FEATS = ['date', 'subject_name', 'num_trials', 'duration(last-first)', 'r0_percent_diff_chance',
+                    'r1_percent_diff_chance', 'r2_percent_diff_chance', 'r3_percent_diff_chance', 'prob_best_reward',
+                    'prob_worst_reward']
+VERSION_NOTE = "V5. Added a simulation as a fifth subject, which assumes color and shape information are " \
+               "independent, and acts as a bayes optimal integrator given that assumption."
 
 
 class SessionData:
@@ -155,9 +160,10 @@ def get_historical_data(dbx) -> Dict[str, pd.DataFrame]:
     for name in SUBJECT_NAMES:
         try:
             metadata, fdata = dbx.files_download(path='/Apps/ShapeColorSpace/MonkData/mturk2_' + name + '_history.csv')
-            historical_data[name] = pd.read_csv(BytesIO(fdata.content))
+            historical_data[name] = pd.read_csv(BytesIO(fdata.content)).sort_values(by='date', axis=0)
         except:
             historical_data[name] = pd.DataFrame(columns=HISTORICAL_FEATS)
+
     return historical_data
 
 
@@ -177,33 +183,44 @@ def save_historical_data(dbx, historical_data: pd.DataFrame):
     return
 
 
-def handler(subject_data: list, historical_data: Dict[str, pd.DataFrame]):
+def handler(subject_data: list, historical_data: Dict[str, pd.DataFrame], sim_agents: List[Agent]):
     """
     Collects analysis, generates test output, and plots analysis.
     returns output text, and saves figures to the saved_data/figures directory
     """
     out = ''
-    colors = ['red', 'green', 'blue', 'purple']
+    colors = ['red', 'green', 'blue', 'purple', 'orange']
     fig1, ax1 = plt.subplots()
     fig2, ax2 = plt.subplots()
     exp_name_set = copy.deepcopy(SUBJECT_NAMES)
-    for i, s in enumerate(sorted(subject_data)):
-        analysis, data = analyze_session(s[0], s[1])
-        exp_name_set.remove(data.monkey_name)
+    res = [analyze_session(s[0], s[1]) for s in subject_data]
+    for a in sim_agents:
+        res.append(analyze_session(*present_previous_trials(a, [d[1] for d in res])))
+    for i, s in enumerate(res):
+        analysis = s[0]
+        data = s[1]
+        try:
+            exp_name_set.remove(data.monkey_name)
+        except KeyError:
+            pass
         sess_duration = (data.trial_time_milliseconds[-1] / 1e3) / (60 * 60)
         new_row = pd.DataFrame.from_dict(
             {9999999: [data.date,
-                data.monkey_name,
-                len(data),
-                sess_duration,
-                float(analysis['percent_diff_chance'][0]),
-                float(analysis['percent_diff_chance'][1]),
-                (analysis['percent_diff_chance'][2]),
-                float(analysis['percent_diff_chance'][3]),
-                float(analysis['percent_best_reward']),
-                float(analysis['percent_worst_reward'])
-                ]}, orient='index', columns=HISTORICAL_FEATS)
-        historical_data[data.monkey_name] = pd.concat([historical_data[data.monkey_name], new_row], ignore_index=True)
+                       data.monkey_name,
+                       len(data),
+                       sess_duration,
+                       float(analysis['percent_diff_chance'][0]),
+                       float(analysis['percent_diff_chance'][1]),
+                       (analysis['percent_diff_chance'][2]),
+                       float(analysis['percent_diff_chance'][3]),
+                       float(analysis['percent_best_reward']),
+                       float(analysis['percent_worst_reward'])
+                       ]}, orient='index', columns=HISTORICAL_FEATS)
+        try:
+            historical_data[data.monkey_name] = pd.concat([historical_data[data.monkey_name], new_row], ignore_index=True)
+        except KeyError:
+            # key error can be thrown due to simulated agents
+            pass
         out += '---------------------------------------\n'
         out += "Subject: " + str(data.monkey_name) + '\n\n'
         out += "Session Date: " + str(data.date) + '\n\n'
@@ -225,16 +242,20 @@ def handler(subject_data: list, historical_data: Dict[str, pd.DataFrame]):
         ax1.set_xlabel("Reward Type (Worst to Best)")
         ax1.set_ylabel("Reward Frequency Percent Difference From Chance ")
         ax1.set_title("MTurk2 Subject Performance " + str(data.date))
-        fig1.legend()
-        ax2.plot([str(ind) for ind in historical_data[data.monkey_name]['date']], historical_data[data.monkey_name]['prob_best_reward'],
-                 color=colors[i],
-                 label=data.monkey_name,
-                 linestyle='--',
-                 marker='o')
-        ax2.set_xlabel("Session Date")
-        ax2.set_ylabel("Probability of Choosing Best Reward on Each Trial")
-        ax2.set_title("MTurk2 Historical Performance " + str(data.date))
-        fig2.legend()
+        fig1.legend(loc=(.127, .64))
+        try:
+            ax2.plot([str(ind)[5:] for ind in historical_data[data.monkey_name]['date']],
+                     historical_data[data.monkey_name]['prob_best_reward'],
+                     color=colors[i],
+                     label=data.monkey_name,
+                     linestyle='--',
+                     marker='o')
+            ax2.set_xlabel("Session Date")
+            ax2.set_ylabel("Probability of Choosing Best Reward on Each Trial")
+            ax2.set_title("MTurk2 Historical Performance " + str(data.date))
+            fig2.legend(loc='upper right')
+        except KeyError:
+            pass
     for unused_name in exp_name_set:
         new_row = pd.Series()
         new_row['date'] = str(date)
@@ -325,12 +346,20 @@ if __name__ == '__main__':
         raise ValueError('Mode must be --prod, --test, or --test_mail.')
     dbx = dropbox_connector(dbx_token)
     subject_data = get_session_data(dbx, date)
+    gt_data = ColorShapeData('../../data/images/imp0.png',
+                             '../../data/reward_space.csv',
+                             '../../data/freq_space.csv',
+                             num_samples=36 * 36)
+    bli_agent = Agent(gt_data, 36, 36, decision_policy='linear_independent_integrator')
+    bli_agent.fit()
+
     output = 'MTurk 2 Progress Report for ' + str(date) + '\n'
     if len(subject_data) == 0:
         output += 'MTurk2 boxes were not setup today.'
 
     historical = get_historical_data(dbx)
-    res = handler(subject_data, historical)
+
+    res = handler(subject_data, historical, [bli_agent])
     output += res[0]
     hist = res[1]
     if mode in ['--prod', '--test_save_hist']:
