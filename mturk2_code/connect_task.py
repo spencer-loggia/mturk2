@@ -19,13 +19,15 @@ def present_previous_trials(agent, all_subject_data: List):
     date = None
     for subject_hist in all_subject_data:
         date = subject_hist.date
-        new_data_dict['Test'].append(subject_hist.color_trials)
-        new_data_dict['TestC'].append(subject_hist.shape_trials)
+        new_data_dict['Test'].append(subject_hist.shape_trials)
+        new_data_dict['TestC'].append(subject_hist.color_trials)
         new_data_dict['RewardStage'].append(subject_hist.reward_map)
         new_data_dict['StartTime'].append(subject_hist.trial_time_milliseconds)
         choices = []
-        for color_trial, shape_trial in zip(subject_hist.color_trials, subject_hist.shape_trials):
-            reward_pred = [agent.predict(s, c) for c, s in zip(color_trial, shape_trial)]
+        for j in range(len(subject_hist.shape_trials)):
+            shape_trial = subject_hist.shape_trials[j]
+            color_trial = subject_hist.color_trials[j]
+            reward_pred = [agent.predict(shape_trial[i], color_trial[i]) for i in range(len(shape_trial))]
             choice = np.argmax(np.array(reward_pred))
             choices.append(choice)
         new_data_dict['Response'].append(np.array(choices))

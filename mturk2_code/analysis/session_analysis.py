@@ -16,7 +16,7 @@ from multiprocessing import Pool
 from mturk2_code.sim import Agent, ColorShapeData
 from mturk2_code.connect_task import present_previous_trials
 
-SUBJECT_NAMES = {'Buzz', 'Tina', 'Yuri', 'Sally'}
+SUBJECT_NAMES = {'Tina', 'Yuri'}
 HISTORICAL_FEATS = ['date', 'subject_name', 'num_trials', 'duration(last-first)', 'r0_percent_diff_chance',
                     'r1_percent_diff_chance', 'r2_percent_diff_chance', 'r3_percent_diff_chance', 'prob_best_reward',
                     'prob_worst_reward']
@@ -55,9 +55,12 @@ class SessionData:
         """
         return the observed probability of picking each reward class.
         """
+        full_freq = [0]*4
         dist = np.choose(self.choices, self.reward_map.T)
-        freq = np.unique(dist, return_counts=True)[1]
-        return freq
+        item, freq = np.unique(dist, return_counts=True)
+        for ind, i in enumerate(item):
+            full_freq[i] = freq[ind]
+        return full_freq
 
     def reward_choice_frequency_marginal(self, axis: str):
         """
@@ -189,13 +192,15 @@ def handler(subject_data: list, historical_data: Dict[str, pd.DataFrame], sim_ag
     returns output text, and saves figures to the saved_data/figures directory
     """
     out = ''
-    colors = ['red', 'green', 'blue', 'purple', 'orange']
+    colors = ['red', 'green', 'blue', 'purple', 'orange', 'grey']
     fig1, ax1 = plt.subplots()
     fig2, ax2 = plt.subplots()
     exp_name_set = copy.deepcopy(SUBJECT_NAMES)
     res = [analyze_session(s[0], s[1]) for s in subject_data]
+    sim_res = []
     for a in sim_agents:
-        res.append(analyze_session(*present_previous_trials(a, [d[1] for d in res])))
+        sim_res.append(analyze_session(*present_previous_trials(a, [d[1] for d in res])))
+    res = res + sim_res
     for i, s in enumerate(res):
         analysis = s[0]
         data = s[1]
@@ -350,8 +355,10 @@ if __name__ == '__main__':
                              '../../data/reward_space.csv',
                              '../../data/freq_space.csv',
                              num_samples=36 * 36)
-    bli_agent = Agent(gt_data, 36, 36, decision_policy='linear_independent_integrator')
-    bli_agent.fit()
+    bli_agent = Agent(36, 36, decision_policy='linear_independent_integrator')
+    bli_agent.fit(gt_data)
+    omni_agent = Agent(36, 36, decision_policy='omniscient')
+    omni_agent.fit(gt_data)
 
     output = 'MTurk 2 Progress Report for ' + str(date) + '\n'
     if len(subject_data) == 0:
@@ -359,7 +366,7 @@ if __name__ == '__main__':
 
     historical = get_historical_data(dbx)
 
-    res = handler(subject_data, historical, [bli_agent])
+    res = handler(subject_data, historical, [bli_agent, omni_agent])
     output += res[0]
     hist = res[1]
     if mode in ['--prod', '--test_save_hist']:
