@@ -18,6 +18,9 @@ def present_previous_trials(agent, all_subject_data: List):
     }
     date = None
     for subject_hist in all_subject_data:
+        if not subject_hist:
+            # continue if this subject is not in this space group
+            continue
         date = subject_hist.date
         new_data_dict['Test'].append(subject_hist.shape_trials)
         new_data_dict['TestC'].append(subject_hist.color_trials)
@@ -33,6 +36,7 @@ def present_previous_trials(agent, all_subject_data: List):
         new_data_dict['Response'].append(np.array(choices))
     for key in new_data_dict.keys():
         new_data_dict[key] = np.concatenate(new_data_dict[key], axis=0)
+    group_descriptor = ''.join(filter(None, [s.monkey_name[0] if s else None for s in all_subject_data]))
     file_destrciptor = str(date.year) + '_' + str(date.month) + '_' + str(date.day) + '_x_x_x_' + \
-                       str(agent.decision_policy).replace('_', '.') + '_sim_' + 'na'
+                       str(agent.decision_policy).replace('_', '.') + '.' + group_descriptor + '_sim_' + 'na'
     return file_destrciptor, new_data_dict

@@ -42,8 +42,8 @@ class ColorShapeData(Dataset):
         return len(self.shapes) * len(self.colors)
 
     def __getitem__(self, item):
-        color_idx = np.floor(item / len(self.shapes))
-        shape_idx = item % len(self.shapes)
+        shape_idx = int(np.floor(item / len(self.shapes)))
+        color_idx = item % len(self.shapes)
         shape = self.shapes[shape_idx]
         collapsed = np.sum(shape, axis=2)
         color_area = np.nonzero(collapsed == 49 + 88 + 163)  # color the white area

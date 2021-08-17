@@ -1,3 +1,5 @@
+import sys
+
 from mturk2_code.sim import ColorShapeData
 import dropbox
 import numpy as np
@@ -36,7 +38,7 @@ class Agent:
         marginals = np.sum(freq_matrix, axis=dim) / num_items
         return marginals
 
-    def _init_linear_independent_integrator(self, reward_matrix):
+    def _init_bli(self, reward_matrix):
         reward_shape_marginal = self.get_reward_marginals('shape', reward_matrix)
         reward_color_marginals = self.get_reward_marginals('color', reward_matrix)
         num_shapes = reward_shape_marginal.shape[0]
@@ -47,34 +49,42 @@ class Agent:
         p_r_sc = numer / reward_dist[None, None, :]
         return p_r_sc
 
+    def _init_conv_net(self):
+        try:
+            from torchvision.models import alexnet
+        except ModuleNotFoundError:
+            print("Torchvision Module Not Found. Please install Torch and Torchvision.", sys.stderr)
+            exit(-3)
+
+
     def fit(self, x):
         """
         Either sets parameters from training data or initialize proper distributions, depending on mode
         """
-        if self.decision_policy == 'linear_independent_integrator':
+        if self.decision_policy == 'bli':
             try:
                 reward_matrix = x.rewards.reshape(self.shape_axis_size, self.color_axis_size)
                 self.freq_matrix = x.freq.reshape(self.shape_axis_size, self.color_axis_size)
             except AttributeError:
                 print('Provided dataset \'x\' must be of type ColorSpaceData.')
                 exit(-1)
-            self.p_r_sc = self._init_linear_independent_integrator(reward_matrix)
+            self.p_r_sc = self._init_bli(reward_matrix)
 
-        elif self.decision_policy == 'omniscient':
+        elif self.decision_policy == 'optimal':
             self.reward_matrix = x.rewards.reshape(self.shape_axis_size, self.color_axis_size)
         else:
             exit(-2)
 
     def predict(self, shape_index, color_index):
-        if self.decision_policy == 'linear_independent_integrator':
+        if self.decision_policy == 'bli':
             if not hasattr(self, 'p_r_sc'):
-                raise AttributeError('Must have run \'fit\' with decision policy \'linear_independent_integrator\'')
+                raise AttributeError('Must have run \'fit\' with decision policy \'bli\'')
             else:
                 reward_dist = self.p_r_sc[shape_index, color_index]
                 return np.argmax(reward_dist)
-        if self.decision_policy == 'omniscient':
+        if self.decision_policy == 'optimal':
             if not hasattr(self, 'reward_matrix'):
-                raise AttributeError('Must have run \'fit\' with decision policy \'omniscient\'')
+                raise AttributeError('Must have run \'fit\' with decision policy \'optimal\'')
             else:
                 return self.reward_matrix[shape_index, color_index]
 
@@ -86,6 +96,6 @@ if __name__ == '__main__':
                           '../../data/freq_space.csv',
                           num_samples=36 * 36)
 
-    ag = Agent(36, 36, decision_policy='omniscient')
+    ag = Agent(36, 36, decision_policy='optimal')
     ag.fit(data)
     print('done')

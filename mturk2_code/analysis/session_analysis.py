@@ -16,12 +16,22 @@ from multiprocessing import Pool
 from mturk2_code.sim import Agent, ColorShapeData
 from mturk2_code.connect_task import present_previous_trials
 
-SUBJECT_NAMES = {'Tina', 'Yuri'}
+SUBJECT_NAMES = {'Tina', 'Yuri', 'Sally', 'Buzz'}
+
 HISTORICAL_FEATS = ['date', 'subject_name', 'num_trials', 'duration(last-first)', 'r0_percent_diff_chance',
                     'r1_percent_diff_chance', 'r2_percent_diff_chance', 'r3_percent_diff_chance', 'prob_best_reward',
                     'prob_worst_reward']
-VERSION_NOTE = "V5. Added a simulation as a fifth subject, which assumes color and shape information are " \
-               "independent, and acts as a bayes optimal integrator given that assumption."
+VERSION_NOTE = "V7. Added simulations using SB (sally, buzz) reward / frequency space."
+
+DESCRIPTION = "Daily progress report for mturk2. Figure one - performance_vs_chance - shows how different the frequency" \
+              " of each reward the monkey received was from our expectation if selections were made randomly. The BLI " \
+              "subject is a simulation that assumes color and shape information are linearly independent. Hopefully " \
+              "the monkeys can preform better than the bli. The Optimal subject knows the true reward space and always " \
+              "makes the best decision, the monkeys should preform worse than optimal. The designatiors after the " \
+              "simulation subjects shows if they were trained / evaluated on the TY (tina and yuri) space or the SB " \
+              "(Buzz and Sally) space. \n The second figure tracks the performance of the real subjects through time, " \
+              "the relevant statistic on the Y-axis measures the probability that a subject chose the best available " \
+              "reward on each trial"
 
 
 class SessionData:
@@ -186,7 +196,9 @@ def save_historical_data(dbx, historical_data: pd.DataFrame):
     return
 
 
-def handler(subject_data: list, historical_data: Dict[str, pd.DataFrame], sim_agents: List[Agent]):
+def handler(subject_data: List[Tuple[str, dict]],
+            historical_data: Dict[str, pd.DataFrame],
+            sim_agents: Dict[frozenset, List[Agent]]):
     """
     Collects analysis, generates test output, and plots analysis.
     returns output text, and saves figures to the saved_data/figures directory
@@ -198,8 +210,13 @@ def handler(subject_data: list, historical_data: Dict[str, pd.DataFrame], sim_ag
     exp_name_set = copy.deepcopy(SUBJECT_NAMES)
     res = [analyze_session(s[0], s[1]) for s in subject_data]
     sim_res = []
-    for a in sim_agents:
-        sim_res.append(analyze_session(*present_previous_trials(a, [d[1] for d in res])))
+    for key in sim_agents.keys():
+        space_group_data = [d[1] if d[1].monkey_name in key else None for d in res]
+        for a in sim_agents[key]:
+            sim_res.append(
+                analyze_session(
+                    *present_previous_trials(a,
+                                             space_group_data)))
     res = res + sim_res
     for i, s in enumerate(res):
         analysis = s[0]
@@ -238,8 +255,7 @@ def handler(subject_data: list, historical_data: Dict[str, pd.DataFrame], sim_ag
         out += "Percent Difference of Observed vs Chance: " + str(list(analysis['percent_diff_chance'] * 100)) + "\n\n"
         out += "Observed Portion of Trials Subject Chose Best Available Reward: " + str(
             analysis['percent_best_reward']) + '\n\n'
-        ax1.plot(np.arange(4), analysis['percent_diff_chance'].reshape(-1),
-                 color=colors[i],
+        ax1.plot(np.arange(4), analysis['percent_diff_chance'].reshape(-1) * 100,
                  label=data.monkey_name,
                  linestyle='--',
                  marker='o')
@@ -247,11 +263,10 @@ def handler(subject_data: list, historical_data: Dict[str, pd.DataFrame], sim_ag
         ax1.set_xlabel("Reward Type (Worst to Best)")
         ax1.set_ylabel("Reward Frequency Percent Difference From Chance ")
         ax1.set_title("MTurk2 Subject Performance " + str(data.date))
-        fig1.legend(loc=(.127, .64))
+        fig1.legend(loc=(.127, .55))
         try:
             ax2.plot([str(ind)[5:] for ind in historical_data[data.monkey_name]['date']],
                      historical_data[data.monkey_name]['prob_best_reward'],
-                     color=colors[i],
                      label=data.monkey_name,
                      linestyle='--',
                      marker='o')
@@ -294,7 +309,7 @@ def communicate(psswd, ptext, date, debug=False):
               "stuart.duffield@nih.gov",
               "shriya.awasthi@nih.gov"]
 
-    ptext = ptext + '\n\n' + VERSION_NOTE
+    ptext = ptext + '\n\nNote\n' + DESCRIPTION + '\n\nChangeLog\n' + VERSION_NOTE
 
     m_message = MIMEMultipart("alternative")
     m_message['Subject'] = ptext.partition('\n')[0]
@@ -351,14 +366,24 @@ if __name__ == '__main__':
         raise ValueError('Mode must be --prod, --test, or --test_mail.')
     dbx = dropbox_connector(dbx_token)
     subject_data = get_session_data(dbx, date)
-    gt_data = ColorShapeData('../../data/images/imp0.png',
-                             '../../data/reward_space.csv',
-                             '../../data/freq_space.csv',
+    gt_data_ty = ColorShapeData('../../data/images/imp0.png',
+                             '../../data/reward_space_TY.csv',
+                             '../../data/freq_space_TY.csv',
                              num_samples=36 * 36)
-    bli_agent = Agent(36, 36, decision_policy='linear_independent_integrator')
-    bli_agent.fit(gt_data)
-    omni_agent = Agent(36, 36, decision_policy='omniscient')
-    omni_agent.fit(gt_data)
+    gt_data_sb = ColorShapeData('../../data/images/imp0.png',
+                             '../../data/reward_space_SB.csv',
+                             '../../data/freq_space_SB.csv',
+                             num_samples=36 * 36)
+    ty_space_group = {'Tina', 'Yuri'}
+    sb_space_group = {'Sally', 'Buzz'}
+    bli_agent_ty = Agent(36, 36, decision_policy='bli')
+    bli_agent_ty.fit(gt_data_ty)
+    bli_agent_sb = Agent(36, 36, decision_policy='bli')
+    bli_agent_sb.fit(gt_data_sb)
+    omni_agent_ty = Agent(36, 36, decision_policy='optimal')
+    omni_agent_ty.fit(gt_data_ty)
+    omni_agent_sb = Agent(36, 36, decision_policy='optimal')
+    omni_agent_sb.fit(gt_data_sb)
 
     output = 'MTurk 2 Progress Report for ' + str(date) + '\n'
     if len(subject_data) == 0:
@@ -366,7 +391,8 @@ if __name__ == '__main__':
 
     historical = get_historical_data(dbx)
 
-    res = handler(subject_data, historical, [bli_agent, omni_agent])
+    res = handler(subject_data, historical, {frozenset(ty_space_group): [bli_agent_ty, omni_agent_ty],
+                                             frozenset(sb_space_group): [bli_agent_sb, omni_agent_sb]})
     output += res[0]
     hist = res[1]
     if mode in ['--prod', '--test_save_hist']:
