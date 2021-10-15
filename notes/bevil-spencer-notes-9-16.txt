@@ -1,0 +1,35 @@
+Spencer / Bevil one-on-one notes 09/16
+
+- Separating monkeys is a pain, hopefully will get better as target training progresses
+	- put up boxes before separating, see if the go where they need to be?
+
+- mturk2 box circuitry complete
+
+- Buiding mturk2 box
+	- waiting on plans from nick…
+	-  if don’t get plans shortly will take some measurements, see if any old mturk1 box parts could be repurposed
+	- possibly can build a box w/o the machine shop
+
+- Juice sucking intervention
+	- stalling a bit 
+	- will have to talk to the machine shop, get them to drill holes in some aluminum stock?
+
+- Mturk2 analysis / paradigm code
+	- second pardigm adjustment today, added 2 second timeout between all trials. 
+	- all monkeys should be getting same juice / reward
+	- calculate each pumps juice delivery per unit reward time the previous day, set reward duration for current day accordingly 
+	- employ location bias correction code… eventually
+	- modify historical graphs to have x-axis by month 
+
+-Color Calibration
+	- plan to test whether projector calibration is actually accurate tomorrow
+		- may do MRI instead do to scanner shutdown, tbd
+	- also will get readings of currency presented colors from mturk1 tablets
+
+- fmri
+	- pipeline is working
+	- got some meridian mapping
+	- python version of pipeline still has issues related to proper surface projection 
+
+Baby monkeys are bouncy 
+

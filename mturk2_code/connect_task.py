@@ -14,7 +14,8 @@ def present_previous_trials(agent, all_subject_data: List):
         'TestC': [],
         'Response': [],
         'RewardStage': [],
-        'StartTime': []
+        'StartTime': [],
+        'ResponseXYT': []
     }
     date = None
     for subject_hist in all_subject_data:
@@ -26,6 +27,8 @@ def present_previous_trials(agent, all_subject_data: List):
         new_data_dict['TestC'].append(subject_hist.color_trials)
         new_data_dict['RewardStage'].append(subject_hist.reward_map)
         new_data_dict['StartTime'].append(subject_hist.trial_time_milliseconds)
+        new_data_dict['ResponseXYT'].append(subject_hist.resp_xyt)
+
         choices = []
         for j in range(len(subject_hist.shape_trials)):
             shape_trial = subject_hist.shape_trials[j]
@@ -39,4 +42,4 @@ def present_previous_trials(agent, all_subject_data: List):
     group_descriptor = ''.join(filter(None, [s.monkey_name[0] if s else None for s in all_subject_data]))
     file_destrciptor = str(date.year) + '_' + str(date.month) + '_' + str(date.day) + '_x_x_x_' + \
                        str(agent.decision_policy).replace('_', '.') + '.' + group_descriptor + '_sim_' + 'na'
-    return file_destrciptor, new_data_dict
+    return [[file_destrciptor, new_data_dict]]
