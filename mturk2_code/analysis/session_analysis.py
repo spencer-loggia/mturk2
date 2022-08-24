@@ -1,5 +1,5 @@
 import sys
-from typing import List, Dict, Union, Tuple
+from typing import List, Dict, Union, Tuple, FrozenSet
 
 import dropbox
 import numpy as np
@@ -16,6 +16,8 @@ from io import BytesIO, StringIO
 from multiprocessing import Pool
 
 from sim import Agent, ColorShapeData
+from data import SessionData
+from visualize import heatmap_scatterplot
 from connect_task import present_previous_trials
 
 import smtplib
@@ -30,8 +32,8 @@ SUBJECT_NAMES = {'Tina', 'Yuri', 'Sally', 'Buzz'}
 HISTORICAL_FEATS = ['date', 'subject_name', 'num_trials', 'duration(last-first)', 'r0_percent_diff_chance',
                     'r1_percent_diff_chance', 'r2_percent_diff_chance', 'r3_percent_diff_chance', 'prob_best_reward',
                     'prob_worst_reward']
-VERSION_NOTE = "V10. Added ability to intelligently merge datasets. "
-
+VERSION_NOTE = "V11. Added new figure that shows subject choices on map of reward space. Shows trials were best choice " \
+               "was made in Green, and trials were a mistake (of any magnitude) was made in cyan"
 
 HISTORICAL_DATE_NOTES = {'2021-09-08': ('A', 'Reward Size Halved (300ms -> 150ms), Penalty Timeout Doubled'),
                          '2021-09-16': ('B', 'Default Inter-Trial Timeouts Added, 2000ms, Max Trial Number Set to 500'),
@@ -39,96 +41,6 @@ HISTORICAL_DATE_NOTES = {'2021-09-08': ('A', 'Reward Size Halved (300ms -> 150ms
                          '2021-10-05': ('D', 'Inter-Trial Timeout Reduced to 500ms. Reward size reduced to 100ms')}
 
 DESCRIPTION = "Key for Historical plot x labels " + str(HISTORICAL_DATE_NOTES)
-
-class SessionData:
-    """
-    an object to hold the data from one session
-    """
-
-    def __init__(self, data_list):
-        """
-        :param data_list: list of tuples of fnames and data dictionaries
-        """
-        base_fname = data_list[0][0]
-        items = re.split('-|_', base_fname)
-        self.date = datetime.date(int(items[0]), int(items[1]), int(items[2]))
-        self.monkey_name = items[6]
-        self.mode = items[7]
-        self.tablet_used = items[-1]
-        self.data_list = data_list
-        shape_trials = []
-        color_trials =[]
-        reward_map = []
-        choices = []
-        resp_xyt = []
-        trial_time_milliseconds = []
-        for _, data_dict in self.data_list:
-            shape_trials.append(np.array(data_dict['Test'], dtype=int))
-            reward_map.append(np.array(data_dict['RewardStage'], dtype=int))
-            color_trials.append(np.array(data_dict['TestC'], dtype=int))
-            choices.append(np.array(data_dict['Response'], dtype=int))
-            resp_xyt.append(np.array(data_dict['ResponseXYT'], dtype=float))
-            trial_time_milliseconds.append(data_dict['StartTime'])
-        self.shape_trials = np.concatenate(shape_trials, axis=0)
-        self.color_trials = np.concatenate(color_trials, axis=0)
-        self.reward_map = np.concatenate(reward_map, axis=0)
-        self.choices = np.concatenate(choices, axis=0)
-        self.resp_xyt = np.concatenate(resp_xyt, axis=0)
-        self.trial_time_milliseconds = np.concatenate(trial_time_milliseconds, axis=0)
-
-    def get_priors(self):
-        """
-        return the observed probability of each reward being presented in this trial.
-        """
-        prior = [0] * 4
-        for i in range(4):
-            prior[i] = float(np.count_nonzero(self.reward_map.reshape(-1) == i) / (len(self) * 4))
-        return np.array(prior)
-
-    def get_real_reward_dist(self):
-        """
-        return the observed probability of picking each reward class.
-        """
-        full_freq = [0]*4
-        dist = np.choose(self.choices, self.reward_map.T)
-        item, freq = np.unique(dist, return_counts=True)
-        for ind, i in enumerate(item):
-            full_freq[i] = freq[ind]
-        return full_freq
-
-    def reward_choice_frequency_marginal(self, axis: str):
-        """
-        return the vector of the frequency that an item presented was chosen best by subject
-        param: axis:str exists in {'shape', 'color'}
-        returns: np.ndarray (1xn)
-        """
-        raise NotImplemented
-
-    def choice_loc_marginal(self):
-        """
-        return the frequency vector at which each screen location is chosen
-        return: np.ndarray (1xd)
-        """
-        raise NotImplemented
-
-    def get_max_reward_prob(self):
-        """
-        get the observed probability that a monkey picked the best reward on a trial
-        """
-        best_choice = np.max(self.reward_map, axis=1)
-        num_best = np.count_nonzero(best_choice == np.choose(self.choices, self.reward_map.T))
-        return num_best / len(self)
-
-    def get_min_reward_prob(self):
-        """
-        get the observed probability that a monkey picked the worst reward on a trial
-        """
-        best_choice = np.min(self.reward_map, axis=1)
-        num_best = np.count_nonzero(best_choice == np.choose(self.choices, self.reward_map.T))
-        return num_best / len(self)
-
-    def __len__(self):
-        return len(self.trial_time_milliseconds)
 
 
 def analyze_session(data_list):
@@ -144,7 +56,8 @@ def analyze_session(data_list):
                 'prior_reward_dist': prior_r_dist * len(data),
                 'percent_diff_chance': ((observed_r_dist - (prior_r_dist * len(data))) / (prior_r_dist * len(data))),
                 'percent_best_reward': data.get_max_reward_prob(),
-                'percent_worst_reward': data.get_min_reward_prob()}
+                'percent_worst_reward': data.get_min_reward_prob(),
+                'choice_freq_data': data.choice_frequency_data()}
     if data.monkey_name in SUBJECT_NAMES:
         analysis['xy_coords'] = data.resp_xyt[:, :2]
     else:
@@ -185,7 +98,7 @@ def get_session_data(dbx, date: datetime.date) -> List[Tuple[str, Dict]]:
                 reported_datetime = f.client_modified
                 if reported_datetime.year != date.year or reported_datetime.month != date.month or reported_datetime.day != date.day:
                     continue
-                #name_set.remove(sname)
+                # name_set.remove(sname)
                 metadata, fdata = dbx.files_download(
                     path='/Apps/ShapeColorSpace/MonkData/' + f.name)
                 if sname in subject_data:
@@ -231,7 +144,7 @@ def save_historical_data(dbx, historical_data: pd.DataFrame):
 
 def handler(subject_data: Dict[str, List[Tuple[str, dict]]],
             historical_data: Dict[str, pd.DataFrame],
-            sim_agents: Dict[frozenset, List[Agent]]):
+            sim_extra):
     """
     Collects analysis, generates test output, and plots analysis.
     returns output text, and saves figures to the saved_data/figures directory
@@ -241,20 +154,28 @@ def handler(subject_data: Dict[str, List[Tuple[str, dict]]],
     fig2, ax2 = plt.subplots()
     fig3, ax3 = plt.subplots(len(subject_data))
 
-    fig3.set_size_inches(8, 4*(len(subject_data)+1))
+    fig3.set_size_inches(8, 6 * (len(subject_data) + 1))
+
     color_map = cm.get_cmap('plasma')
     exp_name_set = copy.deepcopy(SUBJECT_NAMES)
     res = [analyze_session(s) for s in subject_data.values()]
     sim_res = []
-    for key in sim_agents.keys():
+
+    # the below (and the whole handler function really) a bit wonky, new unexpected features have caused data flow
+    # to become overly complex. Should rework project architecture, ideally when full set of desired capabilities
+    # is known
+    for key in list(sim_extra.keys()):
         space_group_data = [d[1] if d[1].monkey_name in key else None for d in res]
-        for a in sim_agents[key]:
+        for a in sim_extra[key]['agents']:
             sim_res.append(
                 analyze_session(
                     present_previous_trials(a,
-                                             space_group_data)))
-    res = res + sim_res
+                                            space_group_data)))
+            sim_extra[frozenset({sim_res[-1][1].monkey_name})] = {'space_params': sim_extra[key]['space_params']}
 
+    res = res + sim_res
+    fig4, ax4 = plt.subplots(len(res))
+    fig4.set_size_inches(8, 4 * (len(res) + 1))
     z_range = [None, None]
     all_date = set()
     for i, s in enumerate(res):
@@ -278,10 +199,17 @@ def handler(subject_data: Dict[str, List[Tuple[str, dict]]],
                        float(analysis['percent_worst_reward'])
                        ]}, orient='index', columns=HISTORICAL_FEATS)
         try:
-            historical_data[data.monkey_name] = pd.concat([historical_data[data.monkey_name], new_row], ignore_index=True)
+            historical_data[data.monkey_name] = pd.concat([historical_data[data.monkey_name], new_row],
+                                                          ignore_index=True)
         except KeyError:
             # key error can be thrown due to simulated agents
             pass
+
+        reward_param = None
+        for key in sim_extra.keys():
+            if data.monkey_name in key:
+                reward_param = sim_extra[key]['space_params'].rewards.reshape(36, 36).T
+
         out += '---------------------------------------\n'
         out += "Subject: " + str(data.monkey_name) + '\n\n'
         out += "Session Date: " + str(data.date) + '\n\n'
@@ -304,6 +232,14 @@ def handler(subject_data: Dict[str, List[Tuple[str, dict]]],
         ax1.set_title("MTurk2 Subject Performance " + str(data.date))
         fig1.legend(loc=(.127, .55))
 
+        if reward_param is not None:
+            heatmap_scatterplot(ax4[i], reward_param,
+                                         analysis['choice_freq_data'][0],
+                                         analysis['choice_freq_data'][1],
+                                         analysis['choice_freq_data'][2])
+            ax4[i].set_xlabel("Shape Axis")
+            ax4[i].set_ylabel("Color Axis")
+            ax4[i].set_title("MTurk2 Subject Choices on Reward Map " + data.monkey_name)
         if data.monkey_name in SUBJECT_NAMES:
             dates = [str(ind) for ind in historical_data[data.monkey_name]['date']]
             xlabel = copy.deepcopy(dates)
@@ -332,6 +268,7 @@ def handler(subject_data: Dict[str, List[Tuple[str, dict]]],
         new_row = pd.Series()
         new_row['date'] = str(date)
         historical_data[unused_name] = historical_data[unused_name].append(new_row, ignore_index=True)
+
     if len(subject_data) > 0:
         all_date = sorted(list(all_date))
         xtick_locs = [j for j, d in enumerate(all_date) if d in HISTORICAL_DATE_NOTES]
@@ -339,10 +276,16 @@ def handler(subject_data: Dict[str, List[Tuple[str, dict]]],
         fig2.autofmt_xdate()
         fig1.savefig('../saved_data/figures/' + str(date) + '_performance_vs_chance_mturk2.png')
         fig2.savefig('../saved_data/figures/' + str(date) + '_historical_mturk2.png')
-        scalarmappaple = cm.ScalarMappable(cmap=color_map)
-        scalarmappaple.set_array(np.arange(z_range[0], z_range[1], (z_range[1] - z_range[0]) / 10))
-        fig3.colorbar(scalarmappaple, orientation='horizontal')
+        scalarmappaple3 = cm.ScalarMappable(cmap=color_map)
+        scalarmappaple3.set_array(np.arange(z_range[0], z_range[1], (z_range[1] - z_range[0]) / 10))
+        fig3.colorbar(scalarmappaple3, orientation='horizontal')
         fig3.savefig('../saved_data/figures/' + str(date) + '_choice_loc_density_mturk2.png')
+        color_map = cm.get_cmap('hot')
+        scalarmappaple4 = cm.ScalarMappable(cmap=color_map)
+        scalarmappaple4.set_array(np.arange(4))
+        fig4.colorbar(scalarmappaple4, orientation='horizontal')
+        fig4.savefig('../saved_data/figures/' + str(date) + '_choice_reward_map_mturk2.jpg')
+
     return out, historical_data
 
 
@@ -372,8 +315,7 @@ def communicate(psswd, ptext, date, debug=False):
               "sl@spencerloggia.com",
               "bevil.conway@nih.gov",
               "tunktunk@icloud.com",
-              "stuart.duffield@nih.gov",
-              "shriya.awasthi@nih.gov"]
+              "stuart.duffield@nih.gov"]
 
     ptext = ptext + '\n\nNote\n' + DESCRIPTION + '\n\nChangeLog\n' + VERSION_NOTE
 
@@ -389,6 +331,9 @@ def communicate(psswd, ptext, date, debug=False):
     m_message = _attach_image(img_name, m_message)
 
     img_name = str(date) + '_choice_loc_density_mturk2.png'
+    m_message = _attach_image(img_name, m_message)
+
+    img_name = str(date) + '_choice_reward_map_mturk2.jpg'
     m_message = _attach_image(img_name, m_message)
 
     m_message.attach(MIMEText(ptext, "plain"))
@@ -420,13 +365,13 @@ if __name__ == '__main__':
     dbx = dropbox_connector(dbx_token)
     subject_data = get_session_data(dbx, date)
     gt_data_ty = ColorShapeData('../../data/images/imp0.png',
-                             '../../data/reward_space_TY.csv',
-                             '../../data/freq_space_TY.csv',
-                             num_samples=36 * 36)
+                                '../../data/reward_space_TY.csv',
+                                '../../data/freq_space_TY.csv',
+                                samples=36 * 36)
     gt_data_sb = ColorShapeData('../../data/images/imp0.png',
-                             '../../data/reward_space_SB.csv',
-                             '../../data/freq_space_SB.csv',
-                             num_samples=36 * 36)
+                                '../../data/reward_space_SB.csv',
+                                '../../data/freq_space_SB.csv',
+                                samples=36 * 36)
     ty_space_group = {'Tina', 'Yuri'}
     sb_space_group = {'Sally', 'Buzz'}
     bli_agent_ty = Agent(36, 36, decision_policy='bli')
@@ -444,8 +389,11 @@ if __name__ == '__main__':
 
     historical = get_historical_data(dbx)
 
-    res = handler(subject_data, historical, {frozenset(ty_space_group): [bli_agent_ty, omni_agent_ty],
-                                             frozenset(sb_space_group): [bli_agent_sb, omni_agent_sb]})
+    res = handler(subject_data, historical, {frozenset(ty_space_group): {'agents': [bli_agent_ty, omni_agent_ty],
+                                                                         'space_params': gt_data_ty},
+                                             frozenset(sb_space_group): {'agents': [bli_agent_sb, omni_agent_sb],
+                                                                         'space_params': gt_data_sb}
+                                             })
     output += res[0]
     hist = res[1]
     if mode in ['--prod', '--test_save_hist']:
