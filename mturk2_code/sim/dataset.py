@@ -13,12 +13,15 @@ from matplotlib import pyplot as plt, cm
 
 
 class ColorShapeData(Dataset):
+    """
+    shape on dim 0, color on dim 1
+    """
 
     def __init__(self, shape_data_path: str,
                  reward_assignment_path: str,
                  prob_stim_path: str,
                  color_spec_path: Union[str, None] = None,
-                 num_samples: int = 1000):
+                 samples: int = 1000):
         super().__init__()
         shapes = Image.open(shape_data_path)
         shapes = np.array(shapes).reshape((400, 36, 400, 3))
@@ -26,7 +29,6 @@ class ColorShapeData(Dataset):
         self.rewards = read_csv(reward_assignment_path).iloc[:, 0].values.reshape(-1)
         exp_prob = np.exp(read_csv(prob_stim_path).iloc[:, 0].values.reshape(-1))
         self.freq = exp_prob / np.sum(exp_prob)
-        self.num_samples = num_samples
         if color_spec_path is None:
             cspace = cm.get_cmap('twilight')
             idx = np.random.choice(np.arange(cspace.N), 36)
@@ -34,7 +36,9 @@ class ColorShapeData(Dataset):
             self.colors = np.array(cspace.colors)[idx] * 255
         else:
             self.colors = np.array(read_csv(color_spec_path).values, dtype=float) * 255
-        self.sample_idxs = np.random.choice(np.arange(len(self)), size=self.num_samples, p=self.freq)
+        if type(samples) is int:
+            self.num_samples = samples
+            self.sample_idxs = np.random.choice(np.arange(len(self)), size=self.num_samples, p=self.freq)
         self.head = 0
         print('loaded data')
 

@@ -56,7 +56,6 @@ class Agent:
             print("Torchvision Module Not Found. Please install Torch and Torchvision.", sys.stderr)
             exit(-3)
 
-
     def fit(self, x):
         """
         Either sets parameters from training data or initialize proper distributions, depending on mode
@@ -87,7 +86,6 @@ class Agent:
                 raise AttributeError('Must have run \'fit\' with decision policy \'optimal\'')
             else:
                 return self.reward_matrix[shape_index, color_index]
-
 
 
 if __name__ == '__main__':
