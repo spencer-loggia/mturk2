@@ -222,6 +222,7 @@ def handler(subject_data: Dict[str, List[Tuple[str, dict]]],
         out += "Percent Difference of Observed vs Chance: " + str(list(analysis['percent_diff_chance'] * 100)) + "\n\n"
         out += "Observed Portion of Trials Subject Chose Best Available Reward: " + str(
             analysis['percent_best_reward']) + '\n\n'
+        out += "Battery level on tablet: " + str(data.battery_level[-1]) + '\n\n'
         ax1.plot(np.arange(4), analysis['percent_diff_chance'].reshape(-1) * 100,
                  label=data.monkey_name,
                  linestyle='--',
