@@ -15,7 +15,7 @@ def present_previous_trials(agent, all_subject_data: List):
         'Response': [],
         'RewardStage': [],
         'StartTime': [],
-        'ResponseXYT': []
+        'ResponseXYT': [],
     }
     date = None
     for subject_hist in all_subject_data:
@@ -39,6 +39,7 @@ def present_previous_trials(agent, all_subject_data: List):
         new_data_dict['Response'].append(np.array(choices))
     for key in new_data_dict.keys():
         new_data_dict[key] = np.concatenate(new_data_dict[key], axis=0)
+    new_data_dict['BatteryPercent'] = (None,)
     group_descriptor = ''.join(filter(None, [s.monkey_name[0] if s else None for s in all_subject_data]))
     file_destrciptor = str(date.year) + '_' + str(date.month) + '_' + str(date.day) + '_x_x_x_' + \
                        str(agent.decision_policy).replace('_', '.') + '.' + group_descriptor + '_sim_' + 'na'

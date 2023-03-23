@@ -25,6 +25,7 @@ class SessionData:
         choices = []
         resp_xyt = []
         trial_time_milliseconds = []
+        battery_level = []
         for _, data_dict in self.data_list:
             shape_trials.append(np.array(data_dict['Test'], dtype=int))
             reward_map.append(np.array(data_dict['RewardStage'], dtype=int))
@@ -32,12 +33,14 @@ class SessionData:
             choices.append(np.array(data_dict['Response'], dtype=int))
             resp_xyt.append(np.array(data_dict['ResponseXYT'], dtype=float))
             trial_time_milliseconds.append(data_dict['StartTime'])
+            battery_level.append(np.array(data_dict['BatteryPercent']))
         self.shape_trials = np.concatenate(shape_trials, axis=0)
         self.color_trials = np.concatenate(color_trials, axis=0)
         self.reward_map = np.concatenate(reward_map, axis=0)
         self.choices = np.concatenate(choices, axis=0)
         self.resp_xyt = np.concatenate(resp_xyt, axis=0)
         self.trial_time_milliseconds = np.concatenate(trial_time_milliseconds, axis=0)
+        self.battery_level = np.concatenate(battery_level, axis=0)
 
     def get_priors(self):
         """

@@ -15,10 +15,10 @@ import pandas as pd
 from io import BytesIO, StringIO
 from multiprocessing import Pool
 
-from sim import Agent, ColorShapeData
-from data import SessionData
+from mturk2_code.sim import Agent, ColorShapeData
+from mturk2_code.analysis.data import SessionData
 from visualize import heatmap_scatterplot
-from connect_task import present_previous_trials
+from mturk2_code.connect_task import present_previous_trials
 
 import smtplib
 import ssl
