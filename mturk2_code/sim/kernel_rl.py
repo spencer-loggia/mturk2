@@ -31,7 +31,7 @@ class KernelRL:
 
         self.inverse_temperature = torch.nn.Parameter(torch.ones(1, device=device, dtype=self.ndtype))
 
-        self.optimizer = torch.optim.Adam(params=[self.init_prob, self.kernel_cov, self.log_lr, self.inverse_temperature], lr=.1)
+        self.optimizer = torch.optim.Adam(params=[self.init_prob, self.kernel_cov, self.log_lr, self.inverse_temperature], lr=.01)
 
     def fit(self, trial_data:pd.DataFrame, epochs=1000):
         """
@@ -40,7 +40,6 @@ class KernelRL:
         ce = torch.nn.CrossEntropyLoss()
         state_spaces = None
         for epoch in range(epochs):
-            loss = torch.zeros((1,), dtype=self.ndtype, device=self.device)
             state_spaces = []
             print("Epoch", epoch)
             self.optimizer.zero_grad()
@@ -48,8 +47,9 @@ class KernelRL:
             # construct gaussian kernel (uses spencer's tools library)
             for ind, trial in trial_data.iterrows():
                 print("trial", ind)
+                kernel_cov = self.kernel_cov.clone() @ self.kernel_cov.T.clone()
                 kernel = util.gaussian_kernel(kernel_size=(self.resolution, self.resolution),
-                                              cov=self.kernel_cov * self.resolution,
+                                              cov=kernel_cov * self.resolution,
                                               integral_resolution=1,
                                               renormalize=False)
                 raw_choices = torch.tensor([[trial.c1, trial.s1],
@@ -66,20 +66,20 @@ class KernelRL:
                 # compute softmax
                 choice_probs = torch.softmax(option_reward_exp * self.inverse_temperature, dim=0)
                 # compare to monkey choice
-                loss = loss + ce(choice_probs, torch.tensor(choice_idx))
+                loss = ce(choice_probs, torch.tensor(choice_idx))
+                # propagate gradient
+                loss.backward(retain_graph=False)
+                self.optimizer.step()
+                self.optimizer.zero_grad()
                 # add state space to list
                 state_spaces.append(state_space.clone())
                 # # update reward space
                 mu = state_space_indexes[choice_idx].detach().tolist()
-                state_space = state_spaces[-1].clone()
+                state_space = state_spaces[-1].detach().clone()
                 # # center kernel on choice
                 centered_kernel = torch.roll(kernel.clone(), mu, dims=(0, 1))
                 state_space = state_space + torch.exp(self.log_lr) * (centered_kernel * reward.detach() - state_space)
 
-            # propagate gradient
-            loss.backward(retain_graph=False)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
         return state_spaces
 
 
