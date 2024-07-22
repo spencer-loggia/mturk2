@@ -15,10 +15,10 @@ import pandas as pd
 from io import BytesIO, StringIO
 from multiprocessing import Pool
 
-from sim import Agent, ColorShapeData
-from data import SessionData
+from mturk2_code.sim import Agent, ColorShapeData
+from mturk2_code.analysis.data import SessionData
 from visualize import heatmap_scatterplot
-from connect_task import present_previous_trials
+from mturk2_code.connect_task import present_previous_trials
 
 import smtplib
 import ssl
@@ -164,129 +164,138 @@ def handler(subject_data: Dict[str, List[Tuple[str, dict]]],
     # the below (and the whole handler function really) a bit wonky, new unexpected features have caused data flow
     # to become overly complex. Should rework project architecture, ideally when full set of desired capabilities
     # is known
-    for key in list(sim_extra.keys()):
-        space_group_data = [d[1] if d[1].monkey_name in key else None for d in res]
-        for a in sim_extra[key]['agents']:
-            sim_res.append(
-                analyze_session(
-                    present_previous_trials(a,
-                                            space_group_data)))
-            sim_extra[frozenset({sim_res[-1][1].monkey_name})] = {'space_params': sim_extra[key]['space_params']}
+    try:
+        for key in list(sim_extra.keys()):
+            space_group_data = [d[1] if d[1].monkey_name in key else None for d in res]
+
+            for a in sim_extra[key]['agents']:
+                sim_res.append(
+                    analyze_session(
+                        present_previous_trials(a,
+                                                space_group_data)))
+                sim_extra[frozenset({sim_res[-1][1].monkey_name})] = {'space_params': sim_extra[key]['space_params']}
+    except ValueError:
+        pass
 
     res = res + sim_res
     fig4, ax4 = plt.subplots(len(res))
     fig4.set_size_inches(8, 4 * (len(res) + 1))
     z_range = [None, None]
     all_date = set()
+    monk_data_arrs = {}
     for i, s in enumerate(res):
         analysis = s[0]
         data = s[1]
+        monk_data_arrs[data.monkey_name] = data.get_full_trial()
         try:
-            exp_name_set.remove(data.monkey_name)
-        except KeyError:
-            pass
-        sess_duration = (data.trial_time_milliseconds[-1] / 1e3) / (60 * 60)
-        new_row = pd.DataFrame.from_dict(
-            {9999999: [data.date,
-                       data.monkey_name,
-                       len(data),
-                       sess_duration,
-                       float(analysis['percent_diff_chance'][0]),
-                       float(analysis['percent_diff_chance'][1]),
-                       (analysis['percent_diff_chance'][2]),
-                       float(analysis['percent_diff_chance'][3]),
-                       float(analysis['percent_best_reward']),
-                       float(analysis['percent_worst_reward'])
-                       ]}, orient='index', columns=HISTORICAL_FEATS)
-        try:
-            historical_data[data.monkey_name] = pd.concat([historical_data[data.monkey_name], new_row],
-                                                          ignore_index=True)
-        except KeyError:
-            # key error can be thrown due to simulated agents
-            pass
+            try:
+                exp_name_set.remove(data.monkey_name)
+            except KeyError:
+                pass
+            sess_duration = (data.trial_time_milliseconds[-1] / 1e3) / (60 * 60)
+            new_row = pd.DataFrame.from_dict(
+                {9999999: [data.date,
+                           data.monkey_name,
+                           len(data),
+                           sess_duration,
+                           float(analysis['percent_diff_chance'][0]),
+                           float(analysis['percent_diff_chance'][1]),
+                           (analysis['percent_diff_chance'][2]),
+                           float(analysis['percent_diff_chance'][3]),
+                           float(analysis['percent_best_reward']),
+                           float(analysis['percent_worst_reward'])
+                           ]}, orient='index', columns=HISTORICAL_FEATS)
+            try:
+                historical_data[data.monkey_name] = pd.concat([historical_data[data.monkey_name], new_row],
+                                                              ignore_index=True)
+            except KeyError:
+                # key error can be thrown due to simulated agents
+                pass
 
-        reward_param = None
-        for key in sim_extra.keys():
-            if data.monkey_name in key:
-                reward_param = sim_extra[key]['space_params'].rewards.reshape(36, 36).T
+            reward_param = None
+            for key in sim_extra.keys():
+                if data.monkey_name in key:
+                    reward_param = sim_extra[key]['space_params'].rewards.reshape(36, 36).T
 
-        out += '---------------------------------------\n'
-        out += "Subject: " + str(data.monkey_name) + '\n\n'
-        out += "Session Date: " + str(data.date) + '\n\n'
-        out += "Trials Completed: " + str(len(data)) + '\n\n'
-        out += "Session Runtime: " + str(sess_duration) + " hours" + '\n\n'
-        out += "Frequency Subject Received Each Reward Type (Worst to Best): " + str(
-            list(analysis['observed_reward_dist'])) + '\n\n'
-        out += "Chance Frequency of Each Reward Type (Worst to Best): " + str(
-            list(analysis['prior_reward_dist'])) + '\n\n'
-        out += "Percent Difference of Observed vs Chance: " + str(list(analysis['percent_diff_chance'] * 100)) + "\n\n"
-        out += "Observed Portion of Trials Subject Chose Best Available Reward: " + str(
-            analysis['percent_best_reward']) + '\n\n'
-        ax1.plot(np.arange(4), analysis['percent_diff_chance'].reshape(-1) * 100,
-                 label=data.monkey_name,
-                 linestyle='--',
-                 marker='o')
-        ax1.set_xticks([0, 1, 2, 3])
-        ax1.set_xlabel("Reward Type (Worst to Best)")
-        ax1.set_ylabel("Reward Frequency Percent Difference From Chance ")
-        ax1.set_title("MTurk2 Subject Performance " + str(data.date))
-        fig1.legend(loc=(.127, .55))
-
-        if reward_param is not None:
-            heatmap_scatterplot(ax4[i], reward_param,
-                                         analysis['choice_freq_data'][0],
-                                         analysis['choice_freq_data'][1],
-                                         analysis['choice_freq_data'][2])
-            ax4[i].set_xlabel("Shape Axis")
-            ax4[i].set_ylabel("Color Axis")
-            ax4[i].set_title("MTurk2 Subject Choices on Reward Map " + data.monkey_name)
-        if data.monkey_name in SUBJECT_NAMES:
-            dates = [str(ind) for ind in historical_data[data.monkey_name]['date']]
-            xlabel = copy.deepcopy(dates)
-            all_date = all_date | set(dates)
-            ax2.plot(xlabel,
-                     historical_data[data.monkey_name]['prob_best_reward'],
+            out += '---------------------------------------\n'
+            out += "Subject: " + str(data.monkey_name) + '\n\n'
+            out += "Session Date: " + str(data.date) + '\n\n'
+            out += "Trials Completed: " + str(len(data)) + '\n\n'
+            out += "Session Runtime: " + str(sess_duration) + " hours" + '\n\n'
+            out += "Frequency Subject Received Each Reward Type (Worst to Best): " + str(
+                list(analysis['observed_reward_dist'])) + '\n\n'
+            out += "Chance Frequency of Each Reward Type (Worst to Best): " + str(
+                list(analysis['prior_reward_dist'])) + '\n\n'
+            out += "Percent Difference of Observed vs Chance: " + str(list(analysis['percent_diff_chance'] * 100)) + "\n\n"
+            out += "Observed Portion of Trials Subject Chose Best Available Reward: " + str(
+                analysis['percent_best_reward']) + '\n\n'
+            ax1.plot(np.arange(4), analysis['percent_diff_chance'].reshape(-1) * 100,
                      label=data.monkey_name,
                      linestyle='--',
                      marker='o')
-            ax2.set_ylabel("Probability of Choosing Best Reward on Each Trial")
-            ax2.set_title("MTurk2 Historical Performance " + str(data.date))
-            fig2.legend(loc='upper right')
+            ax1.set_xticks([0, 1, 2, 3])
+            ax1.set_xlabel("Reward Type (Worst to Best)")
+            ax1.set_ylabel("Reward Frequency Percent Difference From Chance ")
+            ax1.set_title("MTurk2 Subject Performance " + str(data.date))
+            fig1.legend(loc=(.127, .55))
 
-            x = analysis['xy_coords']
-            z = 1 / (squareform(pdist(x)).mean(axis=1))
-            minz = min(z)
-            maxz = max(z)
-            if not z_range[0] or minz < z_range[0]:
-                z_range[0] = minz
-            if not z_range[1] or maxz > z_range[0]:
-                z_range[1] = maxz
-            ax3[i].scatter(x[:, 0], x[:, 1], c=z, cmap=color_map)
-            ax3[i].set_title(data.monkey_name + ' Choice Location Density Map ' + str(data.date))
-            ax3[i].set(adjustable='box', aspect='equal')
-    for unused_name in exp_name_set:
-        new_row = pd.Series()
-        new_row['date'] = str(date)
-        historical_data[unused_name] = historical_data[unused_name].append(new_row, ignore_index=True)
+            if reward_param is not None:
+                heatmap_scatterplot(ax4[i], reward_param,
+                                             analysis['choice_freq_data'][0],
+                                             analysis['choice_freq_data'][1],
+                                             analysis['choice_freq_data'][2])
+                ax4[i].set_xlabel("Shape Axis")
+                ax4[i].set_ylabel("Color Axis")
+                ax4[i].set_title("MTurk2 Subject Choices on Reward Map " + data.monkey_name)
+            if data.monkey_name in SUBJECT_NAMES:
+                dates = [str(ind) for ind in historical_data[data.monkey_name]['date']]
+                xlabel = copy.deepcopy(dates)
+                all_date = all_date | set(dates)
+                ax2.plot(xlabel,
+                         historical_data[data.monkey_name]['prob_best_reward'],
+                         label=data.monkey_name,
+                         linestyle='--',
+                         marker='o')
+                ax2.set_ylabel("Probability of Choosing Best Reward on Each Trial")
+                ax2.set_title("MTurk2 Historical Performance " + str(data.date))
+                fig2.legend(loc='upper right')
 
-    if len(subject_data) > 0:
-        all_date = sorted(list(all_date))
-        xtick_locs = [j for j, d in enumerate(all_date) if d in HISTORICAL_DATE_NOTES]
-        ax2.xaxis.set_ticks(xtick_locs)
-        fig2.autofmt_xdate()
-        fig1.savefig('../saved_data/figures/' + str(date) + '_performance_vs_chance_mturk2.png')
-        fig2.savefig('../saved_data/figures/' + str(date) + '_historical_mturk2.png')
-        scalarmappaple3 = cm.ScalarMappable(cmap=color_map)
-        scalarmappaple3.set_array(np.arange(z_range[0], z_range[1], (z_range[1] - z_range[0]) / 10))
-        fig3.colorbar(scalarmappaple3, orientation='horizontal')
-        fig3.savefig('../saved_data/figures/' + str(date) + '_choice_loc_density_mturk2.png')
-        color_map = cm.get_cmap('hot')
-        scalarmappaple4 = cm.ScalarMappable(cmap=color_map)
-        scalarmappaple4.set_array(np.arange(4))
-        fig4.colorbar(scalarmappaple4, orientation='horizontal')
-        fig4.savefig('../saved_data/figures/' + str(date) + '_choice_reward_map_mturk2.jpg')
+                x = analysis['xy_coords']
+                z = 1 / (squareform(pdist(x)).mean(axis=1))
+                minz = min(z)
+                maxz = max(z)
+                if not z_range[0] or minz < z_range[0]:
+                    z_range[0] = minz
+                if not z_range[1] or maxz > z_range[0]:
+                    z_range[1] = maxz
+                ax3[i].scatter(x[:, 0], x[:, 1], c=z, cmap=color_map)
+                ax3[i].set_title(data.monkey_name + ' Choice Location Density Map ' + str(data.date))
+                ax3[i].set(adjustable='box', aspect='equal')
+        except Exception:
+            pass
+        for unused_name in exp_name_set:
+            new_row = pd.Series()
+            new_row['date'] = str(date)
+            historical_data[unused_name] = pd.concat([historical_data[unused_name], new_row], ignore_index=True)
 
-    return out, historical_data
+        if len(subject_data) > 0:
+            all_date = sorted(list(all_date))
+            xtick_locs = [j for j, d in enumerate(all_date) if d in HISTORICAL_DATE_NOTES]
+            ax2.xaxis.set_ticks(xtick_locs)
+            fig2.autofmt_xdate()
+            fig1.savefig('../saved_data/figures/' + str(date) + '_performance_vs_chance_mturk2.png')
+            fig2.savefig('../saved_data/figures/' + str(date) + '_historical_mturk2.png')
+            scalarmappaple3 = cm.ScalarMappable(cmap=color_map)
+            scalarmappaple3.set_array(np.arange(z_range[0], z_range[1], (z_range[1] - z_range[0]) / 10))
+            fig3.colorbar(scalarmappaple3, orientation='horizontal', ax=ax3)
+            fig3.savefig('../saved_data/figures/' + str(date) + '_choice_loc_density_mturk2.png')
+            color_map = cm.get_cmap('hot')
+            scalarmappaple4 = cm.ScalarMappable(cmap=color_map)
+            scalarmappaple4.set_array(np.arange(4))
+            fig4.colorbar(scalarmappaple4, orientation='horizontal', ax=ax4)
+            fig4.savefig('../saved_data/figures/' + str(date) + '_choice_reward_map_mturk2.jpg')
+
+    return out, historical_data, monk_data_arrs
 
 
 def _attach_image(fname: str, m_message: MIMEMultipart):
@@ -350,20 +359,31 @@ def communicate(psswd, ptext, date, debug=False):
 
 
 if __name__ == '__main__':
+    print(sys.argv[1])
+    dates = None
+    start_date = None
     try:
-        date = datetime.date(int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]))
+        start_date = datetime.date(int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]))
         psswd = sys.argv[4]
         dbx_token = sys.argv[5]
         mode = sys.argv[6]
+        nxt = 7
     except (IndexError, ValueError):
-        date = datetime.date.today() - datetime.timedelta(days=1)
+        start_date = None
         psswd = sys.argv[1]
         dbx_token = sys.argv[2]
         mode = sys.argv[3]
-    if mode not in ['--prod', '--test', '--test_mail', '--test_save_hist']:
+        nxt = 4
+    try:
+        to_extend = sys.argv[nxt] == "--extend"
+    except (IndexError, ValueError):
+        to_extend = False
+
+    print("Running all future", to_extend)
+    if mode not in ['--prod', '--test', '--test_mail', '--test_save_hist', "--to_file"]:
         raise ValueError('Mode must be --prod, --test, --test_save_hist, or --test_mail, not ' + str(mode))
     dbx = dropbox_connector(dbx_token)
-    subject_data = get_session_data(dbx, date)
+
     gt_data_ty = ColorShapeData('../../data/images/imp0.png',
                                 '../../data/reward_space_TY.csv',
                                 '../../data/freq_space_TY.csv',
@@ -383,24 +403,82 @@ if __name__ == '__main__':
     omni_agent_sb = Agent(36, 36, decision_policy='optimal')
     omni_agent_sb.fit(gt_data_sb)
 
-    output = 'MTurk 2 Progress Report for ' + str(date) + '\n'
-    if len(subject_data) == 0:
-        output += 'MTurk2 boxes were not setup today.'
-
     historical = get_historical_data(dbx)
 
-    res = handler(subject_data, historical, {frozenset(ty_space_group): {'agents': [bli_agent_ty, omni_agent_ty],
-                                                                         'space_params': gt_data_ty},
-                                             frozenset(sb_space_group): {'agents': [bli_agent_sb, omni_agent_sb],
-                                                                         'space_params': gt_data_sb}
-                                             })
-    output += res[0]
-    hist = res[1]
-    if mode in ['--prod', '--test_save_hist']:
-        with Pool(len(historical)) as p:
-            p.starmap(save_historical_data, [(dbx, h) for h in historical.values()])
-    print(output)
-    if mode == '--prod':
-        communicate(psswd, output, date, debug=False)
-    if mode == '--test_mail':
-        communicate(psswd, output, date, debug=True)
+    s_paths = {}
+    s_out_dfs = {}
+    # if dates is None (e.g. were scanning over all dates), signal we will consruct data files for each subject by
+    # adding name:path to s_paths dict
+    if dates is None:
+        dates = set()
+        for n in SUBJECT_NAMES:
+            s_paths[n] = "../saved_data/all_" + n + ".csv"
+            for d in historical[n]['date']:
+                this_date = datetime.datetime.strptime(str(d), '%Y-%m-%d').date()
+                if start_date is None or this_date >= start_date:
+                    if to_extend:
+                        dates.add(this_date)
+                    elif this_date == start_date:
+                        dates.add(this_date)
+                        break
+
+
+            if mode == "--to_file":
+                if not(os.path.exists(s_paths[n])) or start_date is None:
+                    # create new file if dne or overwrite if starting from beginining
+                    with open(s_paths[n], "w") as f:
+                        f.write("year\tmonth\tday\ts1\ts2\ts3\ts4\tc1\tc2\tc3\tc4\treward\tchoice_idx\tchoice_x\tchoice_y"
+                                "\treact_time\n")
+                print(n)
+                s_out_dfs[n] = pd.read_csv(s_paths[n], sep="\t")
+    dates = sorted(list(dates))
+
+    for date in dates:
+        subject_data = get_session_data(dbx, date)
+        output = 'MTurk 2 Progress Report for ' + str(date) + '\n'
+        if len(subject_data) == 0:
+            output += 'MTurk2 boxes were not setup today.'
+
+        res = handler(subject_data, historical, {frozenset(ty_space_group): {'agents': [bli_agent_ty, omni_agent_ty],
+                                                                             'space_params': gt_data_ty},
+                                                 frozenset(sb_space_group): {'agents': [bli_agent_sb, omni_agent_sb],
+                                                                             'space_params': gt_data_sb}
+                                                 })
+        output += res[0]
+        hist = res[1]
+        sess_arrs = res[2]
+
+        if mode == "--to_file":
+        # Construct file for subjects given file paths in s_paths
+            for n in sess_arrs.keys():
+                if n in s_paths:
+                    cur_data = s_out_dfs[n]
+                    y = date.year
+                    m = date.month
+                    d = date.day
+                    cur_data = cur_data[(cur_data["year"] != y) | (cur_data["month"] != m) | (cur_data["day"] != d)]
+                    data = sess_arrs[n]
+                    n_trial = len(data)
+                    date_arr = np.tile(np.array([y, m, d], dtype=int)[None, :], (n_trial, 1))
+                    data = np.concatenate([date_arr, data], axis=1)
+                    s_out_dfs[n] = pd.concat([cur_data, pd.DataFrame(data, columns=cur_data.columns)], ignore_index=True, axis=0)
+
+        if mode in ['--prod', '--test_save_hist']:
+            with Pool(len(historical)) as p:
+                p.starmap(save_historical_data, [(dbx, h) for h in historical.values()])
+        print(output)
+        if mode == '--prod':
+            communicate(psswd, output, date, debug=False)
+        if mode == '--test_mail':
+            communicate(psswd, output, date, debug=True)
+
+        if mode == "--to_file":
+            for n in SUBJECT_NAMES:
+                data  = s_out_dfs[n]
+                data.sort_values(by=["year", "month", "day"], inplace=True, ignore_index=True)
+                nona_data = data.dropna()
+                if len(data) - len(nona_data) > 0:
+                    print("Dropped", len(data) - len(nona_data), "NaN trials")
+                nona_data = nona_data.astype(int)
+                nona_data.to_csv(s_paths[n], sep="\t", header=True, index=False)
+

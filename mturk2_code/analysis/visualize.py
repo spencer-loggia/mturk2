@@ -1,4 +1,4 @@
-from sim.dataset import ColorShapeData
+from mturk2_code.sim.dataset import ColorShapeData
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib
 matplotlib.rc('font', family='monospace')

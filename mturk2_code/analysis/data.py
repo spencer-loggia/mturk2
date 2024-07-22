@@ -39,6 +39,16 @@ class SessionData:
         self.resp_xyt = np.concatenate(resp_xyt, axis=0)
         self.trial_time_milliseconds = np.concatenate(trial_time_milliseconds, axis=0)
 
+    def get_full_trial(self):
+        # s1, s2, s3, s4, c1, c2, c3, c4, reward, choice_idx, respx, respy, react_time
+        arr = np.concatenate([self.shape_trials,
+                              self.color_trials,
+                              self.reward_map[np.arange(len(self.reward_map)), self.choices].reshape(-1, 1),
+                              self.choices.reshape(-1, 1),
+                              self.resp_xyt[:, :2],
+                              (self.resp_xyt[:, 2] - self.trial_time_milliseconds).reshape(-1, 1)], axis=1).astype(int)
+        return arr
+
     def get_priors(self):
         """
         return the observed probability of each reward being presented in this trial.

@@ -1,6 +1,6 @@
 import sys
 
-from sim import ColorShapeData
+from mturk2_code.sim import ColorShapeData
 import dropbox
 import numpy as np
 import pandas as pd
