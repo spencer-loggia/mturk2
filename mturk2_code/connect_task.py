@@ -15,7 +15,8 @@ def present_previous_trials(agent, all_subject_data: List):
         'Response': [],
         'RewardStage': [],
         'StartTime': [],
-        'ResponseXYT': []
+        'ResponseXYT': [],
+        'TrialTime': []
     }
     date = None
     for subject_hist in all_subject_data:
@@ -28,6 +29,7 @@ def present_previous_trials(agent, all_subject_data: List):
         new_data_dict['RewardStage'].append(subject_hist.reward_map)
         new_data_dict['StartTime'].append(subject_hist.trial_time_milliseconds)
         new_data_dict['ResponseXYT'].append(subject_hist.resp_xyt)
+        new_data_dict['TrialTime'] += subject_hist.trial_time
 
         choices = []
         for j in range(len(subject_hist.shape_trials)):

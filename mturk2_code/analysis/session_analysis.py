@@ -427,7 +427,7 @@ if __name__ == '__main__':
                 if not(os.path.exists(s_paths[n])) or start_date is None:
                     # create new file if dne or overwrite if starting from beginining
                     with open(s_paths[n], "w") as f:
-                        f.write("year\tmonth\tday\ts1\ts2\ts3\ts4\tc1\tc2\tc3\tc4\treward\tchoice_idx\tchoice_x\tchoice_y"
+                        f.write("year\tmonth\tday\ttime_delta_sec\ts1\ts2\ts3\ts4\tc1\tc2\tc3\tc4\treward\tchoice_idx\tchoice_x\tchoice_y"
                                 "\treact_time\n")
                 print(n)
                 s_out_dfs[n] = pd.read_csv(s_paths[n], sep="\t")

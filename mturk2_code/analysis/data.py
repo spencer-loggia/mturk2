@@ -8,6 +8,8 @@ class SessionData:
     an object to hold the data from one session
     """
 
+    _DATE_OFFSET_TIME = datetime.datetime(year=2021, month=1, day=1)  # timestamps encoded as offset from this date
+
     def __init__(self, data_list):
         """
         :param data_list: list of tuples of fnames and data dictionaries
@@ -25,23 +27,31 @@ class SessionData:
         choices = []
         resp_xyt = []
         trial_time_milliseconds = []
+        absolute_trial_time = []
+        self.trial_time = []
         for _, data_dict in self.data_list:
             shape_trials.append(np.array(data_dict['Test'], dtype=int))
             reward_map.append(np.array(data_dict['RewardStage'], dtype=int))
             color_trials.append(np.array(data_dict['TestC'], dtype=int))
             choices.append(np.array(data_dict['Response'], dtype=int))
             resp_xyt.append(np.array(data_dict['ResponseXYT'], dtype=float))
+            absolute_trial_time.append(np.array([(datetime.datetime.strptime(t, "%Y-%m-%d_%H-%M-%S") - SessionData._DATE_OFFSET_TIME).total_seconds()
+                                                for t in data_dict['TrialTime']],
+                                                dtype=int))
             trial_time_milliseconds.append(data_dict['StartTime'])
+            self.trial_time += data_dict['TrialTime']
         self.shape_trials = np.concatenate(shape_trials, axis=0)
         self.color_trials = np.concatenate(color_trials, axis=0)
         self.reward_map = np.concatenate(reward_map, axis=0)
         self.choices = np.concatenate(choices, axis=0)
         self.resp_xyt = np.concatenate(resp_xyt, axis=0)
         self.trial_time_milliseconds = np.concatenate(trial_time_milliseconds, axis=0)
+        self.absolute_trial_time = np.concatenate(absolute_trial_time, axis=0)[:, None]
 
     def get_full_trial(self):
-        # s1, s2, s3, s4, c1, c2, c3, c4, reward, choice_idx, respx, respy, react_time
-        arr = np.concatenate([self.shape_trials,
+        # trial_time_sec, s1, s2, s3, s4, c1, c2, c3, c4, reward, choice_idx, respx, respy, react_time
+        arr = np.concatenate([self.absolute_trial_time,
+                              self.shape_trials,
                               self.color_trials,
                               self.reward_map[np.arange(len(self.reward_map)), self.choices].reshape(-1, 1),
                               self.choices.reshape(-1, 1),
