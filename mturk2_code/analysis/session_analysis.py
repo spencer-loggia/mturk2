@@ -17,7 +17,7 @@ from multiprocessing import Pool
 
 from mturk2_code.sim import Agent, ColorShapeData
 from mturk2_code.analysis.data import SessionData
-from visualize import heatmap_scatterplot
+from mturk2_code.analysis.visualize import heatmap_scatterplot
 from mturk2_code.connect_task import present_previous_trials
 
 import smtplib
@@ -69,7 +69,8 @@ def analyze_session(data_list):
 def dropbox_connector(access_token: str):
     with dropbox.Dropbox(oauth2_access_token=access_token) as dbx:
         try:
-            print(dbx.users_get_current_account())
+            pass
+            #print(dbx.users_get_current_account())
         except Exception:
             print('Could Not Access Dropbox Using Provided OAuth Token.')
             exit(1)
@@ -283,17 +284,17 @@ def handler(subject_data: Dict[str, List[Tuple[str, dict]]],
             xtick_locs = [j for j, d in enumerate(all_date) if d in HISTORICAL_DATE_NOTES]
             ax2.xaxis.set_ticks(xtick_locs)
             fig2.autofmt_xdate()
-            fig1.savefig('../saved_data/figures/' + str(date) + '_performance_vs_chance_mturk2.png')
-            fig2.savefig('../saved_data/figures/' + str(date) + '_historical_mturk2.png')
+            fig1.savefig('../saved_data/figures/' + str(date) + '_performance_vs_chance_mturk2.svg')
+            fig2.savefig('../saved_data/figures/' + str(date) + '_historical_mturk2.svg')
             scalarmappaple3 = cm.ScalarMappable(cmap=color_map)
             scalarmappaple3.set_array(np.arange(z_range[0], z_range[1], (z_range[1] - z_range[0]) / 10))
             fig3.colorbar(scalarmappaple3, orientation='horizontal', ax=ax3)
-            fig3.savefig('../saved_data/figures/' + str(date) + '_choice_loc_density_mturk2.png')
+            fig3.savefig('../saved_data/figures/' + str(date) + '_choice_loc_density_mturk2.svg')
             color_map = cm.get_cmap('hot')
             scalarmappaple4 = cm.ScalarMappable(cmap=color_map)
             scalarmappaple4.set_array(np.arange(4))
             fig4.colorbar(scalarmappaple4, orientation='horizontal', ax=ax4)
-            fig4.savefig('../saved_data/figures/' + str(date) + '_choice_reward_map_mturk2.jpg')
+            fig4.savefig('../saved_data/figures/' + str(date) + '_choice_reward_map_mturk2.svg')
 
     return out, historical_data, monk_data_arrs
 
