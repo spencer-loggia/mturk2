@@ -6,22 +6,27 @@ import os.path
 import numpy as np
 import torch
 
-import kernel_rl
+#import kernel_rl
 import perceptual_rl
 from matplotlib import pyplot as plt, animation
 import pandas as pd
 import pickle
 import sys
-from neurotools import util, support
+import time
+#from neurotools import util, support
 
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser(prog="MT2RL")
-    parser.add_argument("mode", type=str, choices=["Kernel", "GRU", "nontemporal"])
-    parser.add_argument("name", type=str, choices=["Sally", "Tina", "Yuri", "Buzz"])
+    parser.add_argument("mode", type=str, choices=["Kernel", "GRU", "Elastic"])
+    parser.add_argument("name", type=str, choices=["YT", "SB", "Yuri", "Tina", "Sally", "ALL"])
     parser.add_argument("-l", "--load", nargs=1, type=str, action="store")
     parser.add_argument("-t", "--train", nargs=2, type=int, action="append")
     parser.add_argument("--cuda", action="store_true")
+
+    fit = True
+
+    time.sleep(2.5 * 3600)
 
     args = parser.parse_args()
 
@@ -31,10 +36,17 @@ if __name__=="__main__":
     else:
         EPOCHS = None
         BATCH = None
-    EXT = "test_16"
+    EXT = "bayes_dyno"
     RES = 37
 
-    SUBJECT = args.name
+    if args.name == "YT":
+        SUBJECT = ["Yuri", "Tina"]
+    elif args.name == "Yuri":
+        SUBJECT = ["Yuri"]
+    elif args.name == "Sally":
+        SUBJECT = ["Sally"]
+    elif args.name == "ALL":
+        SUBJECT = ["Yuri", "Tina", "Buzz", "Sally"]
     if args.cuda:
         DEV = "cuda"
     else:
@@ -46,16 +58,23 @@ if __name__=="__main__":
         algo = perceptual_rl.PerceptRL
     elif args.mode == "nontemporal":
         algo = perceptual_rl.NTPerceptRL
+    elif args.mode == "Elastic":
+        algo = perceptual_rl.CSC_RL
     else:
         raise ValueError
 
-    title = "_".join([SUBJECT, EXT, str(EPOCHS), str(BATCH), MODE])
+    title = "_".join([args.name, EXT, MODE])
     print("starting", title)
     figure_out_dir = "../saved_data/out_rl_figs/"
 
     plt.switch_backend('Qt5Agg')
-    subject_trials = "../saved_data/all_" + SUBJECT + ".csv"
-    data = pd.read_csv(subject_trials, sep="\t")
+    data = []
+    for s in SUBJECT:
+        subject_trials = "../saved_data/all_" + s + ".csv"
+        d = pd.read_csv(subject_trials, sep="\t")
+        if SUBJECT == "Tina":
+            d = d.iloc[8500:]
+        data.append(d.head(BATCH))
 
 
 
@@ -64,23 +83,37 @@ if __name__=="__main__":
         with open(args.load[0], "rb") as f:
             model = pickle.load(f)
     else:
-        out_path = "../saved_data/out_models/" + title + ".pkl"
-        model = algo(resolution=RES, device=DEV, expected_plateu=110000, kernel_mode="logistic", positional_dim=4)
+        out_dir = "../saved_data/out_models/"
+        out_path = os.path.join(out_dir,  title + ".pkl")
+        model = algo(resolution=RES, n_c=36, n_s=36, device=DEV, expected_plateu=110000, kernel_mode="logistic", positional_dim=4)
 
-    if args.train:
-        model.fit(data.head(BATCH), epochs=EPOCHS, lr=.02, snap_out=out_path)
+    fit_res = []
+    if args.train and fit:
+        fit_res = model.fit(data, epochs=EPOCHS, lr=.02, snap_out=out_path)
     res = model.get_results()
 
     print("Final Params:")
     for k in res.keys():
         try:
-            if len(res[k].flatten()) < 10:
-                print(k, ":", res[k])
+            print(k, ":", res[k])
         except Exception as e:
             print(e)
 
+    # evaluate GP
+
+
+    coord_hist, val_hist, prob_history = model.predict(data)
+    np.save(os.path.join(out_dir, title + "_coordhist.npy"), coord_hist)
+    np.save(os.path.join(out_dir, title + "_valhist.npy"), val_hist)
+    np.save(os.path.join(out_dir, title + "_probhist.npy"), prob_history)
+    with open(os.path.join(out_dir, title + "_params.txt"), "w") as f:
+        f.write(str(res))
+    with open(out_path, "wb") as f:
+        pickle.dump(model, f)
+
+
     fig, ax = plt.subplots(1)
-    ax.plot(res["epoch_loss_history"])
+    #ax.plot(res["epoch_loss_history"])
 
     if MODE == "kernel":
         fig0, ax0 = plt.subplots(1)
@@ -112,9 +145,6 @@ if __name__=="__main__":
         state_out = os.path.join(figure_out_dir, "kernel_anim_" + title + ".avi")
         support.save_video_from_arrays(kernels, vmin, vmax, state_out)
 
-    model.to("cpu")
-    with open(out_path, "wb") as f:
-        pickle.dump(model, f)
-
+    plt.plot(fit_res)
     plt.show()
 
