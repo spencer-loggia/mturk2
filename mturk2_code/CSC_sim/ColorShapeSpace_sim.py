@@ -60,42 +60,85 @@ class CSC2Env(gym.Env):
     metadata = {"render_modes": ["human"]}
 
     def __init__(
-        self,
-        n: int = 24,
-        k: int = 4,
-        trials: int = 200,
-        *,
-        seed: Optional[int] = None,
-        render: bool = False,
-        win_size: int = 600,
-        render_reward: bool = False,
-        batched: bool = False,
+            self,
+            n: int = 24,
+            k: int = 4,
+            trials: int = 200,
+            *,
+            seed: Optional[int] = None,
+            render: bool = False,
+            win_size: int = 600,
+            render_reward: bool = False,
+            batched: bool = False,
     ):
+        """
+        Initialize CSC2Env.
+
+        Parameters
+        ----------
+        n             : int
+            Grid size (n × n).
+        k             : int
+            Number of options per trial.
+        trials        : int
+            Number of trials per episode (T).
+        seed          : Optional[int]
+            RNG seed.
+        render        : bool
+            Whether to enable pygame rendering.
+        win_size      : int
+            Window size (pixels).
+        render_reward : bool
+            Whether to overlay reward numerals.
+        batched       : bool
+            If True, operate in batched mode (reset→(T,k,2), step→(T,)).
+        """
         super().__init__()
+
+        # core parameters
         self.n, self.k, self.max_trials = n, k, trials
         self.rng = np.random.default_rng(seed)
 
-        # reward / sampling grids
+        # build reward & sampling fields
         R = _wrapped_gaussian_field(n, rng=self.rng)
-        self.reward_grid = np.digitize(R, np.quantile(R, np.linspace(0, 1, 5)[1:-1]))
+        self.reward_grid = np.digitize(
+            R,
+            np.quantile(R, np.linspace(0.0, 1.0, 5)[1:-1])
+        )
         F = _wrapped_gaussian_field(n, rng=self.rng)
-        self.freq_grid = F / F.sum()
+        F /= F.sum()
+        self.freq_grid = F
 
-        # mode & spaces ---------------------------------------------------
+        # precompute flat probability vector for sampling
+        self._flat_probs = F.ravel()  # shape (n*n,)
+
+        # precompute angle look-up table (θ, φ) for every cell
+        idx = np.arange(n)
+        theta = TAU * idx[:, None] / n  # (n,1)
+        phi = TAU * idx[None, :] / n  # (1,n)
+        self._angle_table = np.stack([theta, phi], -1)  # (n,n,2)
+
+        # select mode and fix spaces before vectorisation
         self._batched = bool(batched)
         if self._batched:
-            self.observation_space = spaces.Box(0.0, TAU, (trials, k, 2), np.float32)
-            self.action_space = spaces.MultiDiscrete(np.full(trials, k, np.int64))
+            self.observation_space = spaces.Box(
+                low=0.0, high=TAU, shape=(trials, k, 2), dtype=np.float32
+            )
+            self.action_space = spaces.MultiDiscrete(
+                np.full(trials, k, dtype=np.int64)
+            )
         else:
-            self.observation_space = spaces.Box(0.0, TAU, (k, 2), np.float32)
+            self.observation_space = spaces.Box(
+                low=0.0, high=TAU, shape=(k, 2), dtype=np.float32
+            )
             self.action_space = spaces.Discrete(k)
 
-        # episode state
+        # episode state placeholders
         self._trial = 0
-        self._idx = None            # (k,2) current trial
-        self._idx_batch = None      # (T,k,2) all trials
+        self._idx = None  # for sequential mode
+        self._idx_batch = None  # for batched mode
 
-        # rendering -------------------------------------------------------
+        # rendering parameters
         self.render_flag = render
         self.render_reward = render_reward
         self.win = win_size
@@ -108,10 +151,11 @@ class CSC2Env(gym.Env):
     # utilities
     # ------------------------------------------------------------
     def _sample_indices(self):
-        flat = self.rng.choice(
-            self.n * self.n, size=self.k, replace=False, p=self.freq_grid.ravel()
+        """k unique locations drawn from `freq_grid` (sequential mode)."""
+        flat_idx = self.rng.choice(
+            self.n * self.n, size=self.k, replace=False, p=self._flat_probs
         )
-        return np.column_stack(np.unravel_index(flat, (self.n, self.n)))
+        return np.column_stack((flat_idx // self.n, flat_idx % self.n))
 
     def _angles(self, idx):
         return (TAU * idx / self.n).astype(np.float32)
@@ -125,22 +169,45 @@ class CSC2Env(gym.Env):
     # Gym API
     # ------------------------------------------------------------
     def reset(self, *, seed: Optional[int] = None, options=None, batched: Optional[bool] = None):
+        """
+        Initialise an episode. In batched mode, pre-sample all trials at once.
+        """
         super().reset(seed=seed)
+        # reseed RNG if requested
         if seed is not None:
             self.rng = np.random.default_rng(seed)
-        if batched is not None and bool(batched) != self._batched:
-            raise ValueError("Cannot switch batched/sequential after construction.")
 
+        # disallow switching mode after construction
+        if batched is not None and bool(batched) != self._batched:
+            raise ValueError("Cannot switch batched/sequential mode after construction.")
+
+        # reset sequential counter
         self._trial = 0
 
         if self._batched:
-            self._idx_batch = np.stack(
-                [self._sample_indices() for _ in range(self.max_trials)], axis=0
-            )  # (T,k,2)
-            obs = self._angles(self._idx_batch)
+            # vectorised sample-without-replacement across all T trials
+            T, k, n = self.max_trials, self.k, self.n
+            M = n * n
+
+            # draw Gumbel noise and form perturbed log-probs
+            gumbel = -np.log(-np.log(self.rng.random(size=(T, M))))
+            scores = np.log(self._flat_probs) + gumbel  # shape (T, M)
+
+            # take top-k indices per trial (unordered)
+            topk = np.argpartition(scores, -k, axis=1)[:, -k:]  # (T, k)
+
+            rows = topk // n  # (T, k)
+            cols = topk % n  # (T, k)
+            self._idx_batch = np.stack([rows, cols], axis=-1)  # (T, k, 2)
+
+            # lookup angles via precomputed table → (T, k, 2)
+            obs = self._angle_table[rows, cols]
         else:
-            self._idx = self._sample_indices()
-            obs = self._angles(self._idx)
+            # one trial only
+            self._idx = self._sample_indices()  # (k, 2)
+            rows, cols = self._idx[:, 0], self._idx[:, 1]
+            obs = self._angle_table[rows, cols]  # (k, 2)
+
             if self.render_flag:
                 self._draw_stimuli(obs)
                 pygame.time.wait(400)
