@@ -13,8 +13,8 @@ import numpy as np
 from matplotlib import pyplot as plt
 
 # --------------------------- Hyper‑parameters ---------------------------- #
-BATCH_SIZE     = 4      # number of parallel environments
-EPOCHS         = 500
+BATCH_SIZE     = 6      # number of parallel environments
+EPOCHS         = 200
 EVAL_INTERVAL  = 500      # render every N epochs
 CHUNK_SIZE     = 32
 GAMMA          = 0.99
@@ -31,10 +31,11 @@ class ActorAgent(nn.Module):
     """Little agents for testing. Won't perform in this partially observable space"""
     def __init__(self, obs_dim, n_actions, n_units, n_features, state_size, p_heads, train=True):
         super().__init__()
-        self.input = nn.Linear(obs_dim, n_units * n_features)
+        self.input = nn.Linear(obs_dim, n_units * n_features, device=DEVICE)
         self.model = SSD_cell(n_units, n_features, p_heads, state_size, device=DEVICE)
-        self.output = nn.Linear(n_units, n_actions)
+        self.output = nn.Linear(n_units, n_actions, device=DEVICE)
         self.train = train
+        self.device = device
         self.hidden = []
         self.n_actions = n_actions
         self.n_units = n_units
@@ -62,9 +63,9 @@ class ValueNet(nn.Module):
     def __init__(self, obs_dim, hidden=16):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, 1)
+            nn.Linear(obs_dim, hidden, device=DEVICE), nn.ReLU(),
+            nn.Linear(hidden, hidden, device=DEVICE), nn.ReLU(),
+            nn.Linear(hidden, 1, device=DEVICE)
         )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
@@ -110,7 +111,7 @@ def collect_batch(vec, agent, value_net, chunk_size, device):
     # compute critic value estimates and true reward
     obs_batch = obs_batch.reshape(B, T_max, -1).transpose(0,1) # time, batch, obs
     vals = value_net.forward(torch.concatenate([obs_batch, agent.hidden], dim=2))
-    _, reward, _, _, _ = vec.step(actions.T)
+    _, reward, _, _, _ = vec.step(actions.T.detach().cpu().numpy())
     reward = torch.from_numpy(reward).float().to(device)
     # no mask necessary since we know we have alive trials divisible by chunks
 
@@ -171,8 +172,8 @@ def train(agent=None, loss_function=None):
         act_optim, adone = is_converged(actor_hist, act_optim, BATCH_SIZE, epoch, max_lr=.1)
         crit_optim, cdone = is_converged(critic_hist, crit_optim, BATCH_SIZE, epoch, max_lr=.1)
 
-        critic_hist.append(critic_loss.item())
-        actor_hist.append(actor_loss.item())
+        critic_hist.append(critic_loss.detach().cpu().item())
+        actor_hist.append(actor_loss.detach().cpu().item())
         return_hist.append(ep_ret)
 
         if epoch % 50 == 0:
@@ -199,7 +200,7 @@ def train(agent=None, loss_function=None):
     plt.plot(x_axis, smooth(critic_hist), label='Critic Loss')
     plt.plot(x_axis, smooth(actor_hist),  label='Actor Loss')
     plt.plot(x_axis, smooth(return_hist), label='Mean Return')
-    plt.legend(); plt.xlabel('Epoch (smoothed)'); plt.tight_layout();
+    plt.legend(); plt.xlabel('Epoch (smoothed)'); plt.tight_layout()
     plt.title('Training Curves (window=25)')
     plt.show()
 
