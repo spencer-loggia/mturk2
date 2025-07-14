@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 from gymnasium.vector import SyncVectorEnv
-from xarray_einstats.einops import rearrange
+from einops import rearrange
 
-from ColorShapeSpace_sim import CSC2Env
+from ColorShapeSpace_sim import CSC2Env, make_csc2_vector
 
 from loss import ActorCritic
 from SSM import SSD_cell, ssd
@@ -13,12 +13,12 @@ import numpy as np
 from matplotlib import pyplot as plt
 
 # --------------------------- Hyper‑parameters ---------------------------- #
-BATCH_SIZE     = 4
+BATCH_SIZE     = 4      # number of parallel environments
 EPOCHS         = 500
 EVAL_INTERVAL  = 500      # render every N epochs
 CHUNK_SIZE     = 32
 GAMMA          = 0.99
-MAX_TRIALS     = 100
+MAX_TRIALS     = CHUNK_SIZE * 10
 EVAL_TRIALS    = 25       # trials when rendering policy
 ALPHA_ENTROPY  = 0.01
 LR             = 3e-4
@@ -36,12 +36,14 @@ class ActorAgent(nn.Module):
         self.output = nn.Linear(n_units, n_actions)
         self.train = train
         self.hidden = []
+        self.n_actions = n_actions
+        self.n_units = n_units
 
     def forward(self, obs):          # obs: (t, B,k,2)
         t, B, k, _ = obs.shape
         obs = obs.reshape(t * B, -1)
         x = torch.relu(self.input(obs))
-        x = rearrange(x, '(tB)(kf) -> tBkf', k=k, B=B)
+        x = rearrange(x,'(t B) (k f) -> t B k f', t=t, B=B, k=k)
         y = self.model.forward(x) # <t, b, s>
         self.hidden = y.detach().clone()
         y = y.reshape(t * B, self.n_units)
@@ -104,22 +106,23 @@ def collect_batch(vec, agent, value_net, chunk_size, device):
     logp = dist.log_prob(actions)
     entr = dist.entropy()
 
+    actions = actions.reshape(T_max, B)
     # compute critic value estimates and true reward
-    obs_batch = obs_batch.reshape(B, T_max, -1)
+    obs_batch = obs_batch.reshape(B, T_max, -1).transpose(0,1) # time, batch, obs
     vals = value_net.forward(torch.concatenate([obs_batch, agent.hidden], dim=2))
-    reward = torch.from_numpy(vec.step(actions))
+    _, reward, _, _, _ = vec.step(actions.T)
+    reward = torch.from_numpy(reward).float().to(device)
     # no mask necessary since we know we have alive trials divisible by chunks
 
     # reshape to time and batch
-    reward = reward.reshape(T_max, B)
-    vals = vals.reshape(T_max, B)
+    reward = reward.T
     logp = logp.reshape(T_max, B)
     entr = entr.reshape(T_max, B)
 
     # episode returns per env (before padding) for monitoring
     ep_returns = reward.sum(dim=0).mean().item()
 
-    return (reward.flatten(), vals.flatten(), logp.flatten(), entr.flatten(), None, ep_returns)
+    return (reward, vals, logp, entr, None, ep_returns)
 
 # --------------------------- Play & Render ------------------------------ #
 
@@ -151,7 +154,7 @@ def train(agent=None, loss_function=None):
 
     act_optim = torch.optim.Adam(agent.parameters(), lr=LR)
     crit_optim =  torch.optim.Adam(value_net.parameters())
-    vec = make_vec(BATCH_SIZE)
+    vec = make_csc2_vector(BATCH_SIZE, batched=True, trials=MAX_TRIALS) # use custom environment that allows reward vectors
 
     critic_hist, actor_hist, return_hist = [], [], []
 
@@ -162,10 +165,11 @@ def train(agent=None, loss_function=None):
         critic_loss, actor_loss = loss_fn(rews, vals, logp, entr, mask)
         loss = critic_loss + actor_loss
         act_optim.zero_grad(); crit_optim.zero_grad(); loss.backward(); act_optim.step(); crit_optim.step()
+        agent.reset()
 
         # dynamically adjust LR
-        act_optim, adone = is_converged(actor_hist, act_optim, 1, epoch, max_lr=.1)
-        crit_optim, cdone = is_converged(critic_hist, crit_optim, 1, epoch, max_lr=.1)
+        act_optim, adone = is_converged(actor_hist, act_optim, BATCH_SIZE, epoch, max_lr=.1)
+        crit_optim, cdone = is_converged(critic_hist, crit_optim, BATCH_SIZE, epoch, max_lr=.1)
 
         critic_hist.append(critic_loss.item())
         actor_hist.append(actor_loss.item())

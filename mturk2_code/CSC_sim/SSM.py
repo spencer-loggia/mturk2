@@ -95,7 +95,7 @@ class SSD_cell(torch.nn.Module):
         self.bc_conv = torch.nn.Conv1d(in_channels, 2 * state_dim + head_dim + 1, kernel_size=conv_size, device=device) # position one is the logit, 2 is value est. The spatial dimension will be collapsed into batch when this is applied
         self.passthrough = torch.nn.Linear(in_channels, 1, device=device)
         self.reduce = torch.nn.Linear(head_dim, 1, device=device)
-        self.dt_param = torch.nn.Parameter(torch.tensor([1.]))
+        self.dt_param = torch.nn.Parameter(torch.tensor([0.]))
         self.dt_bias = .01
 
         # the input to the conv in conv_size previous state + the cells output state of each channel.
@@ -158,9 +158,9 @@ class SSD_cell(torch.nn.Module):
         bcax = bcax.view(-1, self.spatial, 2 * self.state_dim + self.head_dim + 1, out_seq_len)
         B = bcax[..., :self.state_dim, :]  # <b, s, n, t>
         C = bcax[..., self.state_dim:2*self.state_dim, :] # <b, s, n, t>
-        A = bcax[..., 2*self.state_dim, :] # <b, s, t>
+        A = bcax[..., 2*self.state_dim, :] # <b, s, t> # for stability, log A < 0
+        A = -1 * torch.abs(A)
         xc = bcax[..., 2*self.state_dim + 1:, :] # <b, s, p, t>
-
         # combined A with the default time constant (log Ad) and get discrete B
         dt = F.softplus(self.dt_param) + self.dt_bias  # <1,>
         lAd = dt * A # <b, s, t>

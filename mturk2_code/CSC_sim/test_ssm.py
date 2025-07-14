@@ -85,7 +85,7 @@ def test_ssd_chunk_assert():
 def test_cell_parallel_equals_sequential():
     torch.manual_seed(123)
     # Small dimensions so the test is lightning-fast
-    seq_len, batch, spatial, feat = 8, 4, 2, 6
+    seq_len, batch, spatial, feat = 12, 4, 2, 6
     cell_cfg = dict(
         spatial=spatial,
         in_channels=feat,
