@@ -1,3 +1,5 @@
+import pickle
+
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
@@ -10,20 +12,22 @@ from loss import ActorCritic
 from SSM import SSD_cell, ssd
 from neurotools.util import is_converged
 import numpy as np
+import matplotlib
 from matplotlib import pyplot as plt
+matplotlib.use('TkAgg')
 
 # --------------------------- Hyper‑parameters ---------------------------- #
-BATCH_SIZE     = 6      # number of parallel environments
-EPOCHS         = 200
-EVAL_INTERVAL  = 500      # render every N epochs
+BATCH_SIZE     = 10      # number of parallel environments
+EPOCHS         = 5000
+EVAL_INTERVAL  = 5000      # render every N epochs
 CHUNK_SIZE     = 32
-GAMMA          = 0.99
-MAX_TRIALS     = CHUNK_SIZE * 10
+GAMMA          = 0.95
+MAX_TRIALS     = CHUNK_SIZE * 30
 EVAL_TRIALS    = 25       # trials when rendering policy
-ALPHA_ENTROPY  = 0.01
-LR             = 3e-4
-N_UNITS        = 8
-HEAD_DIM       = 4
+ALPHA_ENTROPY  = 0.1
+LR             = .01
+N_UNITS        = 12
+HEAD_DIM       = 8
 DEVICE         = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # --------------------------- Agent & ValueNet --------------------------- #
@@ -40,17 +44,26 @@ class ActorAgent(nn.Module):
         self.n_actions = n_actions
         self.n_units = n_units
 
-    def forward(self, obs):          # obs: (t, B,k,2)
-        t, B, k, _ = obs.shape
-        obs = obs.reshape(t * B, -1)
-        x = torch.relu(self.input(obs))
-        x = rearrange(x,'(t B) (k f) -> t B k f', t=t, B=B, k=k)
-        y = self.model.forward(x) # <t, b, s>
+    def _action_from_hidden(self, y):
+        t, B, _ = y.shape
         self.hidden = y.detach().clone()
         y = y.reshape(t * B, self.n_units)
         y = torch.relu(y)
-        action_logit = self.output(y) # <tb, a>
+        action_logit = self.output(y)  # <tb, a>
         return action_logit.reshape(t, B, self.n_actions)
+
+    def forward(self, obs, save_params=False):          # obs: (t, B,n_choices*4)
+        t, B, _ = obs.shape
+        k = self.n_units
+        obs = obs.reshape(t * B, -1)
+        x = torch.relu(self.input(obs))
+        x = rearrange(x,'(t B) (k f) -> t B k f', t=t, B=B, k=k)
+        y = self.model.forward(x, save_params)  # <t, b, s>
+        return self._action_from_hidden(y)
+
+    def recompute(self):
+        y = self.model.recompute()
+        return self._action_from_hidden(y)
 
     def reset(self):
         self.hidden = []
@@ -74,14 +87,16 @@ class ValueNet(nn.Module):
         """
         t =  obs.shape[0]
         b = obs.shape[1]
-        v = self.net(obs.reshape(t *b , -1))
+        v = self.net(obs.reshape(t * b , -1))
         return v.reshape(t, b)
+
 
 # --------------------------- Vector helpers ----------------------------- #
 
 def make_vec(batch):
     """Create a vectorised environment batch for training."""
-    return SyncVectorEnv([lambda: CSC2Env(trials=MAX_TRIALS, render=False, batched=True) for _ in range(batch)])
+    return SyncVectorEnv([lambda: CSC2Env(trials=MAX_TRIALS, render=False, batched=False) for _ in range(batch)])
+
 
 def collect_batch(vec, agent, value_net, chunk_size, device):
     """RUsing vectorized environment in batched mode - in parallel genrate all states and actions from all time in
@@ -94,35 +109,48 @@ def collect_batch(vec, agent, value_net, chunk_size, device):
 
     obs, _ = vec.reset()
 
-    # get forward actions
-    obs_batch, _ = vec.reset()  # batch, time, k, 2
-    obs_batch = torch.from_numpy(obs_batch).float().to(device)
-    obs_batch = obs_batch.transpose(0, 1) # time, batch, k, 2
-    act_logits = agent.forward(obs_batch) # time, batch, k
-    act_logits = act_logits.reshape(T_max * B, k)
+    # get observations in parallel
+    obs_a, _ = vec.reset()  # batch, 1, k, 2
+    obs_a = obs_a.reshape(B, k, 2)
+    obs_a = torch.from_numpy(obs_a).float().to(device)
+    obs = torch.concatenate([torch.sin(obs_a), torch.cos(obs_a)], dim=-1) # b k 4
+    obs = obs.reshape(1, B, k * 4)
+    actions = torch.empty(T_max, B, dtype=torch.int, device=DEVICE)
+    rewards = torch.zeros(T_max + 1, B, device=DEVICE)  # will be added to next input
+    obs_batch = torch.zeros(T_max, B, k * 4, dtype=torch.float32, device=DEVICE)
+    # sequential pass to get all rewards
+    with torch.no_grad():
+        for i in range(MAX_TRIALS):
+            obs_batch[i] = obs[0]
+            act_logits = agent.forward(torch.concatenate([obs, rewards[i][None, :, None]], dim=2),
+                                       save_params=True) # time, batch, k
+            act_logits = act_logits.reshape(1 * B, k)
+            # compute distribution
+            dist = Categorical(logits=act_logits)
+            actions[i] = dist.sample() # need to recall actions so we can evaluate them with the ssd path
+            obs_a, reward, _, _, _ = vec.step(actions[i].T.detach().cpu().numpy())
+            rewards[i + 1] = torch.from_numpy(reward).float().to(DEVICE)
 
-    # compute distribution
+    # compute ssd
+    agent.reset()
+    act_logits = agent.forward(torch.concatenate([obs_batch, rewards[:-1].unsqueeze(2)], dim=2))
+    act_logits = act_logits.reshape(T_max * B, -1)
     dist = Categorical(logits=act_logits)
-    actions = dist.sample() # tb
-    logp = dist.log_prob(actions)
+    logp = dist.log_prob(actions.flatten())
     entr = dist.entropy()
 
-    actions = actions.reshape(T_max, B)
     # compute critic value estimates and true reward
     obs_batch = obs_batch.reshape(B, T_max, -1).transpose(0,1) # time, batch, obs
     vals = value_net.forward(torch.concatenate([obs_batch, agent.hidden], dim=2))
-    _, reward, _, _, _ = vec.step(actions.T.detach().cpu().numpy())
-    reward = torch.from_numpy(reward).float().to(device)
+    reward = rewards[1:] # eliminate the initial blank reward for loss compute.
     # no mask necessary since we know we have alive trials divisible by chunks
 
     # reshape to time and batch
-    reward = reward.T
     logp = logp.reshape(T_max, B)
     entr = entr.reshape(T_max, B)
 
     # episode returns per env (before padding) for monitoring
-    ep_returns = reward.sum(dim=0).mean().item()
-
+    ep_returns = reward.mean().item()
     return (reward, vals, logp, entr, None, ep_returns)
 
 # --------------------------- Play & Render ------------------------------ #
@@ -131,12 +159,17 @@ def play_once(agent):
     env = CSC2Env(trials=EVAL_TRIALS, render=True, render_reward=True)
     obs, _ = env.reset()
     total_r = 0
+    last_r = torch.zeros((1, 1), device=DEVICE)
     while True:
-        obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(DEVICE)
+        obs_t = torch.concatenate([torch.sin(obs_t), torch.cos(obs_t)], dim=-1)
+        obs_t = obs_t.reshape(1, 1, -1)
+        obs_t = torch.concatenate([obs_t, last_r.unsqueeze(-1)], dim=-1)
         with torch.no_grad():
             logits = agent(obs_t)
         action = torch.argmax(logits, dim=-1).item()
         obs, r, done, _, _ = env.step(action)
+        last_r = torch.tensor(r).float().to(device=DEVICE).reshape((1, 1))
         total_r += r
         if done:
             break
@@ -147,18 +180,17 @@ def play_once(agent):
 
 def train(agent=None, loss_function=None):
     k = CSC2Env().k
-    obs_dim = 2 * k
+    obs_dim = 4 * k
 
-    agent     = ActorAgent(obs_dim, k, N_UNITS, 4, 8, 4).to(DEVICE)
+    agent     = ActorAgent(obs_dim + 1, k, N_UNITS, 6, 64, 32).to(DEVICE)
     value_net = ValueNet(obs_dim + N_UNITS).to(DEVICE)
     loss_fn   = ActorCritic(gamma=GAMMA, alpha=ALPHA_ENTROPY)
 
     act_optim = torch.optim.Adam(agent.parameters(), lr=LR)
     crit_optim =  torch.optim.Adam(value_net.parameters())
-    vec = make_csc2_vector(BATCH_SIZE, batched=True, trials=MAX_TRIALS) # use custom environment that allows reward vectors
+    vec = make_csc2_vector(BATCH_SIZE, batched=False, trials=MAX_TRIALS) # use custom environment that allows reward vectors
 
     critic_hist, actor_hist, return_hist = [], [], []
-
     for epoch in range(1, EPOCHS + 1):
         (rews, vals, logp, entr, mask, ep_ret) = collect_batch(
             vec, agent, value_net, CHUNK_SIZE, DEVICE)
@@ -176,10 +208,12 @@ def train(agent=None, loss_function=None):
         actor_hist.append(actor_loss.detach().cpu().item())
         return_hist.append(ep_ret)
 
-        if epoch % 50 == 0:
+        if epoch % 10 == 0:
             print(f"Epoch {epoch:04d} | Critic {critic_loss.item():.3f} | Actor {actor_loss.item():.3f} | R {ep_ret:.2f}")
 
         if epoch % EVAL_INTERVAL == 0:
+            with open("/home/bizon/Projects/mturk2/mturk2_code/CSC_sim/models/ssm_csc.pkl", "wb") as f:
+                pickle.dump(agent, f)
             print("--- Evaluation ---")
             play_once(agent)
 

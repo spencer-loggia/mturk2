@@ -1,5 +1,7 @@
 import math
 import importlib
+
+import numpy as np
 import pytest
 import torch
 import SSM as ssm
@@ -112,3 +114,121 @@ def test_cell_parallel_equals_sequential():
 
     # close agreement, tolerating minor FP noise
     assert torch.allclose(Y_parallel, Y_sequential, atol=1e-3, rtol=1e-3)
+
+
+# A short test of sequence copying
+
+def test_ssd_cell_learns_copy_task():
+    from torch.nn import MSELoss
+    from torch.optim import Adam
+    # reproducibility
+    torch.manual_seed(0)
+
+    # hyperparameters
+    seq_len, batch, spatial, features = 50, 1, 2, 3
+    head_dim, state_dim = 4, 2
+    chunk_size = seq_len  # no chunking for simplicity
+    lr = 1e-2
+    steps = 200
+    tol = 1e-2
+
+    # model
+    model = SSDCell(
+        spatial=spatial,
+        in_channels=features,
+        head_dim=head_dim,
+        state_dim=state_dim,
+        conv_size=1,
+        chunk_size=chunk_size,
+        device="cpu"
+    )
+    model.train()
+
+    # optimizer & loss
+    optimizer = Adam(model.parameters(), lr=lr)
+    loss_fn = MSELoss()
+
+    # create a random “sequence” and set target = input projected to output dims
+    inp = torch.randn(seq_len, batch, spatial, features)
+    # SSD_cell outputs shape (t, b, s); here we’ll copy the L2 norm per feature
+    target = inp.mean(dim=-1)  # shape: (t, b, spatial)
+
+    # training loop
+    for _ in range(steps):
+        optimizer.zero_grad()
+        out = model(inp)               # (t, b, s)
+        loss = loss_fn(out, target)
+        loss.backward()
+        optimizer.step()
+
+    # validation
+    model.eval()
+    with torch.no_grad():
+        final_out = model(inp)
+        final_loss = loss_fn(final_out, target).item()
+    print()
+    print(target[:, 0, 0].detach().cpu().tolist())
+    print(out[:, 0, 0].detach().cpu().tolist())
+    # assert that it has learned to “copy”
+    assert final_loss < tol, f"Final MSE {final_loss:.4f} exceeds tolerance {tol}"
+
+
+def test_ssd_cell_learns_next_token_prediction():
+    import torch
+    from torch.nn import MSELoss
+    from torch.optim import Adam
+    from SSM import SSD_cell
+
+    # reproducibility
+    torch.manual_seed(0)
+
+    # hyperparameters
+    seq_len, batch, spatial, features = 20, 1, 2, 3
+    head_dim, state_dim = 4, 2
+    chunk_size = seq_len  # no chunking
+    lr = 1e-2
+    steps = 1000
+    tol = 1e-3
+
+    # model
+    model = SSD_cell(
+        spatial=spatial,
+        in_channels=features,
+        head_dim=head_dim,
+        state_dim=state_dim,
+        conv_size=1,
+        chunk_size=chunk_size,
+        device="cpu"
+    )
+    model.train()
+
+    # optimizer & loss
+    optimizer = Adam(model.parameters(), lr=lr)
+    loss_fn = MSELoss()
+
+    # random sequence; next-token targets
+    seq = torch.from_numpy(np.random.choice(np.array([-.2, -.1, .1, .2], dtype=float), size=seq_len))
+    inp = torch.zeros(seq_len, batch, spatial, features)
+    inp += seq[:, None, None, None]
+    target = torch.zeros(seq_len, batch, spatial)
+    # for t in [0..seq_len-2], predict the next input’s feature-mean
+    target[:-1] = inp[1:].mean(dim=-1)
+    # target[-1] stays zero
+
+    # training loop
+    for _ in range(steps):
+        optimizer.zero_grad()
+        out = model(inp)  # (t, b, s)
+        loss = loss_fn(out, target)
+        loss.backward()
+        optimizer.step()
+
+    # validation
+    model.eval()
+    with torch.no_grad():
+        final_out = model(inp)
+        final_loss = loss_fn(final_out, target).item()
+    print()
+    print(torch.round(target[:, 0, 0].detach().cpu() * 10).int().tolist())
+    print(torch.round(final_out[:, 0, 0].detach().cpu() * 10).int().tolist())
+    assert final_loss < tol, f"Final MSE {final_loss:.4f} exceeds tolerance {tol}"

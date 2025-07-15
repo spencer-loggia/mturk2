@@ -61,7 +61,7 @@ class CSC2Env(gym.Env):
 
     def __init__(
             self,
-            n: int = 24,
+            n: int = 36,
             k: int = 4,
             trials: int = 200,
             *,
@@ -116,7 +116,7 @@ class CSC2Env(gym.Env):
         idx = np.arange(n)
         theta = TAU * idx[:, None] / n  # (n,1)
         phi = TAU * idx[None, :] / n  # (1,n)
-        self._angle_table = np.stack([theta, phi], -1)  # (n,n,2)
+        self._angle_table = np.stack([np.tile(theta, (1, n)), np.tile(phi, (n, 1))], -1)  # (n,n,2)
 
         # select mode and fix spaces before vectorisation
         self._batched = bool(batched)
