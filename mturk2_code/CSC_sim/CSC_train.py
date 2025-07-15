@@ -9,7 +9,7 @@ from einops import rearrange
 from ColorShapeSpace_sim import CSC2Env, make_csc2_vector
 
 from loss import ActorCritic
-from SSM import SSD_cell, ssd
+from SSM import SSM, SSMConfig, InferenceCache
 from neurotools.util import is_converged
 import numpy as np
 import matplotlib
@@ -26,23 +26,28 @@ MAX_TRIALS     = CHUNK_SIZE * 30
 EVAL_TRIALS    = 25       # trials when rendering policy
 ALPHA_ENTROPY  = 0.1
 LR             = .01
-N_UNITS        = 12
+N_UNITS        = 16
 HEAD_DIM       = 8
 DEVICE         = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+ssm_configuration =SSMConfig(
+        d_model=N_UNITS, d_state=8, d_conv=2, expand=1, headdim=2, chunk_size=64,
+    )
 
 # --------------------------- Agent & ValueNet --------------------------- #
 class ActorAgent(nn.Module):
     """Little agents for testing. Won't perform in this partially observable space"""
     def __init__(self, obs_dim, n_actions, n_units, n_features, state_size, p_heads, train=True):
         super().__init__()
-        self.input = nn.Linear(obs_dim, n_units * n_features, device=DEVICE)
-        self.model = SSD_cell(n_units, n_features, p_heads, state_size, device=DEVICE)
+        self.input = nn.Linear(obs_dim, n_units, device=DEVICE)
+        self.model = SSM(ssm_configuration, device=DEVICE)
         self.output = nn.Linear(n_units, n_actions, device=DEVICE)
-        self.train = train
         self.device = device
         self.hidden = []
         self.n_actions = n_actions
         self.n_units = n_units
+        self.cache = None
 
     def _action_from_hidden(self, y):
         t, B, _ = y.shape
@@ -52,13 +57,16 @@ class ActorAgent(nn.Module):
         action_logit = self.output(y)  # <tb, a>
         return action_logit.reshape(t, B, self.n_actions)
 
-    def forward(self, obs, save_params=False):          # obs: (t, B,n_choices*4)
+    def forward(self, obs, save_params=False):   # obs: (t, B,n_choices*4)
         t, B, _ = obs.shape
+        if self.train and self.cache is not None:
+            self.cache = InferenceCache.alloc(batch_size=B, args=ssm_configuration)
         k = self.n_units
         obs = obs.reshape(t * B, -1)
         x = torch.relu(self.input(obs))
         x = rearrange(x,'(t B) (k f) -> t B k f', t=t, B=B, k=k)
-        y = self.model.forward(x, save_params)  # <t, b, s>
+        y, h = self.model.forward(x)  # <t, b, s>
+        self.cache = h
         return self._action_from_hidden(y)
 
     def recompute(self):
@@ -66,8 +74,8 @@ class ActorAgent(nn.Module):
         return self._action_from_hidden(y)
 
     def reset(self):
+        self.cache = None
         self.hidden = []
-        self.model.reset()
 
 
 class ValueNet(nn.Module):
