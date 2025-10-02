@@ -1,3 +1,4 @@
+import copy
 import json
 from dataclasses import dataclass
 from typing import Iterable, NamedTuple, TypeAlias, cast
@@ -13,7 +14,7 @@ Device: TypeAlias = str | torch.device | None
 
 @dataclass
 class SSMConfig:
-    d_model: int  # model dimension (D)
+    d_model: int = 256  # model dimension (D)
     d_state: int = 128  # state dimension (N)
     d_conv: int = 4  # convolution kernel size
     expand: int = 2  # expansion factor (E)
@@ -26,9 +27,13 @@ class SSMConfig:
         self.nheads = self.d_inner // self.headdim
 
 
-class InferenceCache(NamedTuple):
+class InferenceCache:
     conv_state: Tensor  # (batch, d_inner + 2 * d_state, d_conv)
     ssm_state: Tensor  # (batch, nheads, headdim, d_state)
+
+    def __init__(self, conv_state, ssm_state):
+        self.conv_state = conv_state
+        self.ssm_state = ssm_state
 
     @staticmethod
     def alloc(batch_size: int, args: SSMConfig, device: Device = None):
@@ -41,6 +46,9 @@ class InferenceCache(NamedTuple):
             ),
         )
 
+    def clone(self):
+        return copy.deepcopy(self)
+
 
 class SSM(nn.Module):
     def __init__(self, args: SSMConfig, device: Device = None):
@@ -48,8 +56,8 @@ class SSM(nn.Module):
         self.args = args
         self.device = device
 
-        # Order: (z, x, B, C, dt)
-        d_in_proj = 2 * args.d_inner + 2 * args.d_state + args.nheads
+        # Order: (x/z, B/C, dt)
+        d_in_proj = args.d_inner + args.d_state + args.nheads
         self.in_proj = nn.Linear(args.d_model, d_in_proj, bias=False, device=device)
 
         conv_dim = args.d_inner + 2 * args.d_state
@@ -62,9 +70,9 @@ class SSM(nn.Module):
             device=device,
         )
 
-        self.dt_bias = nn.Parameter(torch.empty(args.nheads, device=device))
-        self.A_log = nn.Parameter(torch.empty(args.nheads, device=device))
-        self.D = nn.Parameter(torch.empty(args.nheads, device=device))
+        self.dt_bias = nn.Parameter(torch.zeros(args.nheads, device=device))
+        self.A_log = nn.Parameter(torch.zeros(args.nheads, device=device))
+        self.D = nn.Parameter(torch.ones(args.nheads, device=device))
         self.norm = RMSNorm(args.d_inner, device=device)
         self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=False, device=device)
 
@@ -84,15 +92,18 @@ class SSM(nn.Module):
 
         A = -torch.exp(self.A_log)  # (nheads,)
         zxbcdt = self.in_proj(u)  # (batch, seqlen, d_in_proj)
-        z, xBC, dt = torch.split(
+        x, B, dt = torch.split(
             zxbcdt,
             [
                 self.args.d_inner,
-                self.args.d_inner + 2 * self.args.d_state,
+                self.args.d_state,
                 self.args.nheads,
             ],
             dim=-1,
         )
+        z = x.clone()
+        C = B.clone()
+        xBC = torch.cat([x, B, C], dim=-1)
         dt = F.softplus(dt + self.dt_bias)  # (batch, seqlen, nheads)
 
         # Pad or truncate xBC seqlen to d_conv
@@ -100,7 +111,7 @@ class SSM(nn.Module):
             rearrange(xBC, "b l d -> b d l"), (self.args.d_conv - u.shape[1], 0)
         )
 
-        xBC = silu(
+        xBC = normal(
             self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, : u.shape[1], :]
         )  # (batch, seqlen, d_inner + 2 * d_state))
         x, B, C = torch.split(
@@ -115,9 +126,10 @@ class SSM(nn.Module):
             self.args.chunk_size,
             device=self.device,
         )
-        y = y + x * self.D.unsqueeze(-1)
+        y = y # + x * self.D.unsqueeze(-1)
         y = rearrange(y, "b l h p -> b l (h p)")
         y = self.norm(y, z)
+        self.out_proj.weight.data = torch.ones_like(self.out_proj.weight.data)
         y = self.out_proj(y)
 
         h = InferenceCache(conv_state, ssm_state)
@@ -143,16 +155,24 @@ class SSM(nn.Module):
         """
         assert u.shape[1] == 1, "Only one token can be decoded per inference step"
 
+        bs = u.shape[0]
+        if bs > 1 and h.conv_state.shape[0] == 1 and h.ssm_state.shape[0] == 1:
+            h.conv_state = torch.tile(h.conv_state, (bs, 1, 1))
+            h.ssm_state = torch.tile(h.ssm_state, (bs, 1, 1, 1))
+
         zxbcdt = self.in_proj(u.squeeze(1))  # (batch, d_in_proj)
-        z, xBC, dt = torch.split(
+        x, B, dt = torch.split(
             zxbcdt,
             [
                 self.args.d_inner,
-                self.args.d_inner + 2 * self.args.d_state,
+                self.args.d_state,
                 self.args.nheads,
             ],
             dim=-1,
         )
+        z = x.clone()
+        C = B.clone()
+        xBC = torch.cat([x, B, C], dim=-1)
 
         # Advance convolution input
         h.conv_state.copy_(torch.roll(h.conv_state, shifts=-1, dims=-1))
@@ -162,7 +182,7 @@ class SSM(nn.Module):
             h.conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
         )
         xBC += self.conv1d.bias
-        xBC = silu(xBC)
+        xBC = normal(xBC)
 
         x, B, C = torch.split(
             xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
@@ -177,9 +197,10 @@ class SSM(nn.Module):
         # update the inference cache
         h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
         y = torch.einsum("bhpn, bn -> bhp", h.ssm_state, C)
-        y = y + rearrange(self.D, "h -> h 1") * x
+        y = y #+ rearrange(self.D, "h -> h 1") * x
         y = rearrange(y, "b h p -> b (h p)")
         y = self.norm(y, z)
+        self.out_proj.weight.data = torch.ones_like(self.out_proj.weight.data)
         y = self.out_proj(y)
 
         return y.unsqueeze(1), h
@@ -276,11 +297,10 @@ class RMSNorm(nn.Module):
 
     def forward(self, x, z=None):
         if z is not None:
-            x = x * silu(z)
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+            x = x * normal(z)
+        return x # * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
-
-def silu(x):
-    """Applies the Sigmoid Linear Unit (SiLU), element-wise.
-    """
-    return x * F.sigmoid(x)
+def normal(x):
+    return x * torch.sigmoid(x)
+    # d = torch.distributions.Normal(torch.zeros_like(x), torch.ones_like(x))
+    # return torch.exp(d.log_prob(x))

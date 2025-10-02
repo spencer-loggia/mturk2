@@ -70,23 +70,23 @@ def test_ssd_chunk_divisor_assert():
 # SSM end-to-end -----------------------------------------------------
 def test_ssm_parallel_vs_step():
     torch.manual_seed(123)
-    B, T, D = 4, 12, 8                      # model dim D
-    cfg = SSMConfig(d_model=D, d_state=3, d_conv=3, expand=1, headdim=4, chunk_size=4)
-    model = SSM(cfg, device="cpu")
-    u = torch.randn(B, T, D)
+    B, T, D = 4, 64*8, 8                      # model dim D
+    cfg = SSMConfig(d_model=D, d_state=3, d_conv=3, expand=1, headdim=4, chunk_size=64)
+    model = SSM(cfg, device="cuda")
+    u = torch.randn(B, T, D, device="cuda")
 
     # full sequence (parallel)
     y_par, _ = model(u)                     # (B,T,D)
 
     # token-wise (recurrent)
-    h = InferenceCache.alloc(B, cfg)
+    h = InferenceCache.alloc(B, cfg, device="cuda")
     outs = []
     for t in range(T):
         y_t, h = model.step(u[:, t : t + 1], h)
         outs.append(y_t)
     y_seq = torch.cat(outs, dim=1)
 
-    assert torch.allclose(y_par, y_seq, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(y_par, y_seq, atol=1e-6, rtol=1e-6)
 
 
 # ------------------------------------------------------------------
