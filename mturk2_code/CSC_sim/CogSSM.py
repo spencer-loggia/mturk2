@@ -14,11 +14,11 @@ Device: TypeAlias = str | torch.device | None
 
 @dataclass
 class SSMConfig:
-    d_model: int = 256  # model dimension (D)
-    d_state: int = 128  # state dimension (N)
-    d_conv: int = 4  # convolution kernel size
+    d_model: int = 2  # model dimension (D)
+    d_state: int = 1  # state dimension (N)
+    d_conv: int = 2  # convolution kernel size
     expand: int = 2  # expansion factor (E)
-    headdim: int = 64  # parallel head dimension (P)
+    headdim: int = 2  # parallel head dimension (P)
     chunk_size: int = 64  # matrix partition size (Q)
 
     def __post_init__(self):

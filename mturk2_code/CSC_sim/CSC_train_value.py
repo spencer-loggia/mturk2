@@ -9,6 +9,7 @@ from gymnasium.vector import SyncVectorEnv
 from neurotools.util import is_converged
 
 from ColorShapeSpace_sim import CSC2Env, make_csc2_vector
+from combined_model import Deform, QAgent, AgentConfig
 from loss import TemporalDifference                    # TD(λ=0) loss impl
 from CogSSM import SSM, SSMConfig, InferenceCache
 import numpy as np
@@ -18,7 +19,7 @@ matplotlib.use('TkAgg')
 
 # ----------------------------- Hyper‑parameters -----------------------------
 BATCH_SIZE     = 10         # parallel environments
-EPOCHS         = 2000
+EPOCHS         = 3000
 EVAL_INTERVAL  = 500         # render every N epochs
 CHUNK_SIZE     = 64          # SSM chunk size
 DIMS           = 1
@@ -26,19 +27,23 @@ MAX_TRIALS     = CHUNK_SIZE * 5
 GAMMA          = 0.0         # discount for TD target
 ALPHA_ENTROPY  = 0.01        # entropy bonus coefficient
 LR             = 1e-2
-N_UNITS        = 2
-HEAD_DIM       = 2
+N_UNITS        = 4
+HEAD_DIM       = 4
 NUM_CHOICES    = 1
 DEVICE         = "cpu" # torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SEED_OVERRIDE = None
 SELF_ACTION = False
 
 # ----------------------------- SSM config -----------------------------------
-ssm_config = SSMConfig(
+agent_config = AgentConfig(
     d_model=N_UNITS,
     d_state=1,
     d_conv=2,
     expand=1,
+    percept_dim=2,
+    reward_dim= 1,
+    action_dims=(1,),
+    device="cpu",
     headdim=HEAD_DIM,
     chunk_size=CHUNK_SIZE,
 )
@@ -55,70 +60,13 @@ def build_value_obs(obs_a: np.ndarray, prev_r: torch.Tensor) -> torch.Tensor:
     returns: tensor  (B*k, 5)  – sin, cos, reward features per option
     """
     B, k, _ = obs_a.shape
-    feat = torch.from_numpy(obs_a).float().to(DEVICE)           # B,k,2
+    if not torch.is_tensor(obs_a):
+        obs_a = torch.from_numpy(obs_a).to(DEVICE)           # B,k,2
+    feat = obs_a.to(torch.float)
     feat = torch.cat([torch.sin(feat), torch.cos(feat)], dim=-1)  # B,k,4
     feat = feat.view(B * k, DIMS * 2)
     r = prev_r.repeat_interleave(k).unsqueeze(1)                 # B*k,1
     return torch.cat([feat, r], dim=1)                           # B*k,5
-
-# ---------------------------------------------------------------------------
-# Model: Q‑value network with internal SSM state + temperature scaling
-# ---------------------------------------------------------------------------
-
-class QAgent(nn.Module):
-    """Maps (sin,cos,reward) features -> scalar Q‑value for each option.
-
-    The policy is derived via soft‑max(Q / τ) with learnable temperature τ.
-    """
-
-    def __init__(self, obs_dim: int, n_actions: int):
-        super().__init__()
-        self.n_actions = n_actions
-        self.obs_dim   = obs_dim
-
-        self.input = nn.Linear(obs_dim, N_UNITS, bias=True, device=DEVICE)
-        self.ssm   = SSM(ssm_config, device=DEVICE)
-        self.head  = torch.nn.Parameter(torch.tensor([0.], device=DEVICE)) # nn.Linear(N_UNITS, 1, bias=False, device=DEVICE)    # scalar Q
-        # temperature parameter (log parameterization for positivity)
-        self.log_tau = nn.Parameter(torch.zeros((1), device=DEVICE))
-        self.sa = torch.tensor([0.], device=DEVICE)
-        self.sa_net = torch.nn.Linear(in_features=self.ssm.args.d_inner * self.ssm.args.d_state, out_features=DIMS)
-        self.hidden = None  # b, p, h, s
-
-        # Inference cache for sequential rollout
-        self.sequential = False
-        self.cache      = None
-
-    # ---------------------------------------------------------------------
-    def forward(self, obs: torch.Tensor, *, k: int):
-        """obs: (T, B*k, obs_dim)   → values (T,B,k) and logits (T,B,k)"""
-        T, Bk, _ = obs.shape
-
-        # if operating with self action need to add action to network.
-        if self.sequential and self.cache is None:
-            self.cache = InferenceCache.alloc(batch_size=Bk, args=ssm_config, device=DEVICE)
-        if self.sequential:
-            h = self.cache
-        else:
-            h = None
-        x = (self.input(obs.float().view(T * Bk, -1)))          # (T*Bk,N_UNITS)
-        x = rearrange(x, '(t b) s -> t b s', t=T, b=Bk)           # (T,Bk,N_UNITS)
-
-        y, self.cache = self.ssm(x.transpose(0, 1), h)   # (T,Bk,N_UNITS)
-        self.hidden = self.cache.ssm_state.clone()
-        y = y.transpose(0, 1)
-
-        q = torch.sum(y, dim=-1) * torch.nn.functional.softplus(self.head)                     # (T,Bk)
-        q = q.view(T, -1, k)                                      # (T,B,k)
-
-        tau = torch.exp(self.log_tau)
-        logits = q / tau
-        return q, logits
-
-    # ---------------------------------------------------------------------
-    def reset(self):
-        self.sequential = False
-        self.cache = None
 
 
 def _collapse_agent_cache(cache, B, action):
@@ -152,7 +100,7 @@ def _expand_agent_cache(cache, B, k):
 # Roll‑out to collect trajectories for Q‑learning
 # ---------------------------------------------------------------------------
 
-def collect_batch_q(vec, agent: QAgent):
+def collect_batch_q(vec, agent: QAgent, deformer: Deform):
     """Generate one full episode (T=MAX_TRIALS) of experience.
 
     Returns
@@ -162,7 +110,7 @@ def collect_batch_q(vec, agent: QAgent):
     entropy  : scalar – mean policy entropy (for bonus)
     """
     B   = vec.num_envs
-    k   = agent.n_actions
+    k   = NUM_CHOICES
     T   = MAX_TRIALS
 
     obs_a, _ = vec.reset()                            # (B,k,2)
@@ -178,7 +126,15 @@ def collect_batch_q(vec, agent: QAgent):
     # --------------- rollout ---------------
     with torch.no_grad():
         for t in range(T):
-            inp = build_value_obs(obs_a, prev_r)           # (B*k,5)
+            # deform obs by the perceptual deformation
+            inp = build_value_obs(obs_a, prev_r)           # (B*k,D*2 + 1)
+            percept = deformer(inp[:, :agent_config.percept_dim]) # apply deform
+
+            # We apply noise because this grounds the perceptual units.
+            percept = percept + torch.normal(mean=0., std=.1, size=percept.shape, device=percept.device)
+
+
+            inp[:, :agent_config.percept_dim] = percept
             agent.cache = _expand_agent_cache(agent.cache, B, k)
             q, logits = agent(inp.unsqueeze(0), k=k)       # (1,B,k)
             logits = logits.squeeze(0)                     # (B,k)
@@ -190,6 +146,7 @@ def collect_batch_q(vec, agent: QAgent):
             obs_seq[t] = inp.reshape(B, k, 2 * DIMS + 1)[np.arange(B), act, :]
 
             obs_a, r, _, _, _ = vec.step(act.cpu().numpy())
+
             # by default the agent save a cache with BATCH indexes, but we want to collapse to the index of the
             # item we actually chose:
             agent.cache = _collapse_agent_cache(agent.cache, B, act)
@@ -204,7 +161,7 @@ def collect_batch_q(vec, agent: QAgent):
 # Evaluation episode (greedy policy, rendered)
 # ---------------------------------------------------------------------------
 
-def play_once(agent: QAgent, *, trials: int, disp_steps: int = 30, render=True, seed=None, k=None):
+def play_once(agent: QAgent, deformer: Deform, *, trials: int, disp_steps: int = 30, render=True, seed=None, k=None):
     if SEED_OVERRIDE is not None:
         seed = SEED_OVERRIDE
     if k is None:
@@ -226,7 +183,10 @@ def play_once(agent: QAgent, *, trials: int, disp_steps: int = 30, render=True, 
         if (step + 1) % disp_steps == 0:
             env.render_reward = render; env.render_flag = render
 
-        inp = build_value_obs(obs_a[np.newaxis, ...], prev_r).unsqueeze(0)  # (1,k,5)
+        inp = build_value_obs(obs_a[np.newaxis, ...], prev_r)  # (k,5)
+        percept = deformer(inp[:, :agent_config.percept_dim])
+        inp[:, :agent_config.percept_dim] = percept
+        inp = inp.unsqueeze(0)
         agent.cache = _expand_agent_cache(agent.cache, 1, env.k)
         with torch.no_grad():
             _, logits = agent(inp, k=env.k)                                 # (1,1,k)
@@ -266,10 +226,11 @@ def train():
     # if SELF_ACTION:
     #     obs_dim = obs_dim + DIMS
 
-    agent = QAgent(obs_dim, k).to(DEVICE)
+    agent = QAgent(agent_config).to(DEVICE)
+    deform = Deform(channels=agent_config.percept_dim)
 
     td_loss_fn = TemporalDifference(gamma=GAMMA, normalize=True)
-    optimizer  = torch.optim.Adam(agent.parameters(), lr=LR)
+    optimizer  = torch.optim.Adam(list(agent.parameters()) + list(deform.parameters()), lr=LR)
 
     if DIMS == 1:
         one_d = True
@@ -291,7 +252,7 @@ def train():
         vec = make_csc2_vector(BATCH_SIZE, n=n, batched=False, trials=MAX_TRIALS, k=NUM_CHOICES, one_d=one_d,
                                seeds=[SEED_OVERRIDE] * BATCH_SIZE)
 
-        obs_seq, rewards, _ = collect_batch_q(vec, agent)
+        obs_seq, rewards, _ = collect_batch_q(vec, agent, deform)
 
         # add replay
         keys = random.sample(list(storage), min(len(storage), 5 * BATCH_SIZE))
@@ -310,7 +271,8 @@ def train():
         q_pred = q_pred / (torch.arange(MAX_TRIALS, device=DEVICE, dtype=torch.float).unsqueeze(1) + 1)
 
         td_loss = td_loss_fn(q_pred, r_rewards)
-        loss = td_loss # - ALPHA_ENTROPY * entropy
+        deform_cost = deform.compute_penalty() # need to ensure is orientation preserving homeomorphism
+        loss = td_loss + deform_cost # - ALPHA_ENTROPY * entropy
 
         optimizer.zero_grad(); loss.backward(); optimizer.step()
         optimizer, adone = is_converged(loss_hist, optimizer, BATCH_SIZE, epoch, max_lr=.01)
@@ -330,14 +292,16 @@ def train():
             print(f"Ep {epoch:04d} | TD {td_loss.item():.3f} | R {ret_hist[-1]:.2f}")
 
         if epoch % EVAL_INTERVAL == 0:
-            with open("models/p1h2s1_ssm_csc_q_1d" + str(epoch) + ".pkl", "wb") as f:
+            with open("models/cog_ssm_" + str(epoch) + ".pkl", "wb") as f:
                 pickle.dump(agent.state_dict(), f)
+            with open("models/deform_" + str(epoch) + ".pkl", "wb") as f:
+                pickle.dump(deform.state_dict(), f)
             print("--- Evaluation ---")
-            play_once(agent, trials=MAX_TRIALS, render=False, k=max(agent.n_actions, 2))
+            play_once(agent, deform, trials=MAX_TRIALS, render=False, k=2)
 
     # final render ------------------------------------------------------
     print("=== Final Policy Evaluation ===")
-    play_once(agent, trials=MAX_TRIALS, render=False)
+    play_once(agent, deform, trials=MAX_TRIALS, render=False)
 
     # ---------------------- Plot metrics ------------------------------
     if len(loss_hist) >= 25:
