@@ -1,37 +1,46 @@
-import copy
-import json
 from dataclasses import dataclass
-from typing import Iterable, NamedTuple, TypeAlias, cast
-
 import torch
 import torch.nn.functional as F
+from torch import nn, Tensor
 from einops import rearrange, repeat
-from torch import LongTensor, Tensor, nn
 
-# based on a modeifed version of John Ma's mamba minimal
+Device = str | torch.device | None
 
-Device: TypeAlias = str | torch.device | None
-
+# ---------------- config ----------------
 @dataclass
 class SSMConfig:
-    d_model: int = 2  # model dimension (D)
-    d_state: int = 1  # state dimension (N)
-    d_conv: int = 2  # convolution kernel size
-    expand: int = 2  # expansion factor (E)
-    headdim: int = 2  # parallel head dimension (P)
-    chunk_size: int = 64  # matrix partition size (Q)
+    d_model: int = 256
+    d_state: int = 128
+    d_conv: int = 4
+    expand: int = 2
+    headdim: int = 64
+    chunk_size: int = 64
+
+    # existing I/O overrides
+    input_dim: int | None = None
+    output_dim: int | None = None
+
+    # reward feature size for B(reward)
+    reward_dim: int = 1
 
     def __post_init__(self):
         self.d_inner = self.expand * self.d_model
         assert self.d_inner % self.headdim == 0
         self.nheads = self.d_inner // self.headdim
+        if self.input_dim is None:
+            self.input_dim = self.d_model
+        if self.output_dim is None:
+            self.output_dim = self.d_model
 
 
+# --------------- cache ------------------
 class InferenceCache:
-    conv_state: Tensor  # (batch, d_inner + 2 * d_state, d_conv)
-    ssm_state: Tensor  # (batch, nheads, headdim, d_state)
+    # (batch, d_inner + d_state, d_conv)  # CHANGED (was d_inner + 2*d_state)
+    conv_state: Tensor
+    # (batch, nheads, headdim, d_state)
+    ssm_state: Tensor
 
-    def __init__(self, conv_state, ssm_state):
+    def __init__(self, conv_state: Tensor, ssm_state: Tensor):
         self.conv_state = conv_state
         self.ssm_state = ssm_state
 
@@ -39,7 +48,7 @@ class InferenceCache:
     def alloc(batch_size: int, args: SSMConfig, device: Device = None):
         return InferenceCache(
             torch.zeros(
-                batch_size, args.d_inner + 2 * args.d_state, args.d_conv, device=device
+                batch_size, args.d_inner + args.d_state, args.d_conv, device=device
             ),
             torch.zeros(
                 batch_size, args.nheads, args.headdim, args.d_state, device=device
@@ -47,163 +56,191 @@ class InferenceCache:
         )
 
     def clone(self):
+        import copy
         return copy.deepcopy(self)
 
 
+# --------------- model ------------------
 class SSM(nn.Module):
     def __init__(self, args: SSMConfig, device: Device = None):
         super().__init__()
         self.args = args
         self.device = device
 
-        # Order: (x/z, B/C, dt)
-        d_in_proj = args.d_inner + args.d_state + args.nheads
-        self.in_proj = nn.Linear(args.d_model, d_in_proj, bias=False, device=device)
+        # in-proj now produces: z (d_inner), xC preconv (d_inner + d_state), dt (nheads)
+        d_in_proj = 2 * args.d_inner + 1 * args.d_state + args.nheads
+        self.in_proj = nn.Linear(args.input_dim, d_in_proj, bias=True, device=device)
 
-        conv_dim = args.d_inner + 2 * args.d_state
+        # depthwise conv over xC only
+        self.conv_dim = args.d_inner + args.d_state
         self.conv1d = nn.Conv1d(
-            in_channels=conv_dim,
-            out_channels=conv_dim,
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
             kernel_size=args.d_conv,
-            groups=conv_dim,
+            groups=self.conv_dim,
             padding=args.d_conv - 1,
             device=device,
         )
 
+        # B is linear in reward ONLY
+        self.B_proj = nn.Linear(args.reward_dim, args.d_state, bias=True, device=device)
+
         self.dt_bias = nn.Parameter(torch.zeros(args.nheads, device=device))
-        self.A_log = nn.Parameter(torch.zeros(args.nheads, device=device))
+        self.A_log = torch.zeros(args.nheads, device=device)
         self.D = nn.Parameter(torch.ones(args.nheads, device=device))
         self.norm = RMSNorm(args.d_inner, device=device)
-        self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=False, device=device)
+        self.out_proj = nn.Linear(args.d_inner, args.output_dim, bias=False, device=device)
 
-    def forward(self, u: Tensor, h: InferenceCache | None = None):
+    # ---- Shared helpers -----------------------------------------------------
+
+    def _project(self, u: Tensor, reward: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """
-        Arguments
-            u: (batch, seqlen, d_model) input. seqlen should be a multiple of chunk_size.
-            h: hidden states for inference step. Initialized to 0s if not present.
-
-        Return (y, h)
-            y: (batch, seqlen, d_model) output
-            h: updated inference cache after processing `u`
+        u: (b, l, input_dim)
+        Returns:
+            z:   (b, l, d_inner)
+            xC:  (b, l, d_inner + d_state)   # pre-conv features for x and C
+            dt:  (b, l, nheads), softplus(+bias) applied
+            B:  (b, l, state_dim)
         """
-        # if passed and inference cache, we are running in sequential mode
-        if h:
-            return self.step(u, h)
-
-        A = -torch.exp(self.A_log)  # (nheads,)
-        zxbcdt = self.in_proj(u)  # (batch, seqlen, d_in_proj)
-        x, B, dt = torch.split(
-            zxbcdt,
-            [
-                self.args.d_inner,
-                self.args.d_state,
-                self.args.nheads,
-            ],
+        zxc_dt = self.in_proj(u)  # (b, l, 2*d_inner + d_state + nheads)
+        z, xC, dt = torch.split(
+            zxc_dt,
+            [self.args.d_inner, self.conv_dim, self.args.nheads],
             dim=-1,
         )
-        z = x.clone()
-        C = B.clone()
-        xBC = torch.cat([x, B, C], dim=-1)
-        dt = F.softplus(dt + self.dt_bias)  # (batch, seqlen, nheads)
+        dt = F.softplus(dt + self.dt_bias)
 
-        # Pad or truncate xBC seqlen to d_conv
-        conv_state = F.pad(
-            rearrange(xBC, "b l d -> b d l"), (self.args.d_conv - u.shape[1], 0)
-        )
+        # compute B from reward only
+        l = reward.shape[1]
+        B = self.B_proj(rearrange(reward, "b l 1 -> (b l) 1"))                   # (b, l, d_state)
+        B = rearrange(B, "(b l) s -> b l s", l=l)
 
-        xBC = normal(
-            self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, : u.shape[1], :]
-        )  # (batch, seqlen, d_inner + 2 * d_state))
-        x, B, C = torch.split(
-            xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
-        )
-        x = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
+        return z, xC, dt, B
+
+    def _conv_and_split(
+        self, xC: Tensor, h: InferenceCache | None
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """
+        Depthwise conv over xC, split into x and C.
+
+        Args:
+            xC: (b, l, d_inner + d_state)
+            h : None (full) or cache (step, l==1)
+
+        Returns:
+            x:          (b, l, d_inner)
+            C:          (b, l, d_state)
+            conv_state: (b, d_inner + d_state, d_conv)
+        """
+        if h is None:
+            l = xC.shape[1]
+            xC_conv = silu(self.conv1d(xC.transpose(1, 2)).transpose(1, 2))[:, :l, :]
+            conv_state = F.pad(rearrange(xC, "b l d -> b d l"), (self.args.d_conv - l, 0))
+        else:
+            assert xC.shape[1] == 1, "Step mode expects seqlen=1"
+            xC_last = xC.squeeze(1)  # (b, conv_dim)
+            # roll buffer and insert
+            h.conv_state.copy_(torch.roll(h.conv_state, shifts=-1, dims=-1))
+            h.conv_state[:, :, -1] = xC_last
+            # depthwise conv
+            weight_dw = rearrange(self.conv1d.weight, "d 1 w -> d w")
+            xC_conv = torch.sum(h.conv_state * weight_dw, dim=-1)
+            xC_conv = xC_conv + self.conv1d.bias
+            xC_conv = silu(xC_conv).unsqueeze(1)
+            conv_state = h.conv_state
+
+        x, C = torch.split(xC_conv, [self.args.d_inner, self.args.d_state], dim=-1)
+        C = torch.ones_like(C)
+        return x, C, conv_state
+
+    # ---- Public API ---------------------------------------------------------
+
+    def forward(self, u: Tensor, reward: Tensor, h: InferenceCache | None = None):
+        """
+        u:       (batch, seqlen, input_dim)
+        reward:  (batch, seqlen, reward_dim)   -> ONLY used to compute B
+        Returns:
+            y: (batch, seqlen, output_dim)
+            h: InferenceCache
+        """
+        if h is not None:
+            return self.step(u, reward, h)
+
+        # projections
+        A = -torch.exp(self.A_log)                # (nheads,)
+        z, xC, dt, B = self._project(u, reward)              # (b,l,d_inner), (b,l,conv_dim), (b,l,nheads)
+        x, C, conv_state = self._conv_and_split(xC, h=None)
+        # SSD
+        x_heads = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
         y, ssm_state = ssd(
-            x * dt.unsqueeze(-1),
+            x_heads * dt.unsqueeze(-1),
             A * dt,
-            rearrange(B, "b l n -> b l 1 n"),
+            rearrange(B, "b l n -> b l 1 n"),     # broadcast over heads
             rearrange(C, "b l n -> b l 1 n"),
             self.args.chunk_size,
             device=self.device,
         )
-        y = y # + x * self.D.unsqueeze(-1)
         y = rearrange(y, "b l h p -> b l (h p)")
         y = self.norm(y, z)
-        self.out_proj.weight.data = torch.ones_like(self.out_proj.weight.data)
         y = self.out_proj(y)
 
-        h = InferenceCache(conv_state, ssm_state)
-        return y, h
+        new_h = InferenceCache(conv_state, ssm_state)
+        return y, new_h
 
-    def step(self, u: Tensor, h: InferenceCache) -> tuple[Tensor, InferenceCache]:
-        """Take a single inference step for the current input and hidden state
-
-        Unlike attention-based models, RNN-based models (eg Mamba) does not need
-        to look back at all the past tokens to generate a new token. Instead a
-        hidden state (initialized to 0s initially) is updated for each input and
-        passed to the next inference step. This means that the total inference
-        time is linear with respect to the sequence length instead of quadratic
-        in attention's case.
-
-        Arguments
-            u: (batch, 1, d_model)
-            h: initial/running hidden state
-
-        Return (y, h)
-            y: (batch, 1, d_model)
-            h: updated hidden state
+    def step(self, u: Tensor, reward: Tensor, h: InferenceCache) -> tuple[Tensor, InferenceCache]:
         """
-        assert u.shape[1] == 1, "Only one token can be decoded per inference step"
+        Single-token step.
+        u:      (batch, 1, input_dim)
+        reward: (batch, 1, reward_dim)
+        Returns:
+            y: (batch, 1, output_dim)
+        """
+        assert u.shape[1] == 1 and reward.shape[1] == 1, "step() expects seqlen=1"
 
         bs = u.shape[0]
         if bs > 1 and h.conv_state.shape[0] == 1 and h.ssm_state.shape[0] == 1:
             h.conv_state = torch.tile(h.conv_state, (bs, 1, 1))
             h.ssm_state = torch.tile(h.ssm_state, (bs, 1, 1, 1))
 
-        zxbcdt = self.in_proj(u.squeeze(1))  # (batch, d_in_proj)
-        x, B, dt = torch.split(
-            zxbcdt,
-            [
-                self.args.d_inner,
-                self.args.d_state,
-                self.args.nheads,
-            ],
-            dim=-1,
-        )
-        z = x.clone()
-        C = B.clone()
-        xBC = torch.cat([x, B, C], dim=-1)
+        # shared projections
+        z, xC, dt, B = self._project(u, reward)             # (b,1,·)
+        x, C, _ = self._conv_and_split(xC, h)
 
-        # Advance convolution input
-        h.conv_state.copy_(torch.roll(h.conv_state, shifts=-1, dims=-1))
-        h.conv_state[:, :, -1] = xBC
-        # Convolution step
-        xBC = torch.sum(
-            h.conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
-        )
-        xBC += self.conv1d.bias
-        xBC = normal(xBC)
+        # B from reward only
+        B = self.B_proj(reward).squeeze(1)       # (b, d_state)
 
-        x, B, C = torch.split(
-            xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
-        )
-        A = -torch.exp(self.A_log)  # (nheads,)
+        # scalar SSM update
+        A = -torch.exp(self.A_log)
+        dt = dt.squeeze(1)                       # (b, nheads)
+        dA = torch.exp(dt * A)
+        x = rearrange(x.squeeze(1), "b (h p) -> b h p", p=self.args.headdim)
+        C = C.squeeze(1)                         # (b, d_state)
 
-        # SSM step
-        dt = F.softplus(dt + self.dt_bias)  # (batch, nheads)
-        dA = torch.exp(dt * A)  # (batch, nheads)
-        x = rearrange(x, "b (h p) -> b h p", p=self.args.headdim)
         dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
-        # update the inference cache
         h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
         y = torch.einsum("bhpn, bn -> bhp", h.ssm_state, C)
-        y = y #+ rearrange(self.D, "h -> h 1") * x
         y = rearrange(y, "b h p -> b (h p)")
-        y = self.norm(y, z)
-        self.out_proj.weight.data = torch.ones_like(self.out_proj.weight.data)
+        y = self.norm(y, z.squeeze(1))
         y = self.out_proj(y)
 
         return y.unsqueeze(1), h
+
+
+# --------- utilities (unchanged) ----------
+class RMSNorm(nn.Module):
+    def __init__(self, d: int, eps: float = 1e-5, device: Device = None):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d, device=device))
+
+    def forward(self, x, z=None):
+        if z is not None:
+            x = x * silu(z)
+        return x  # * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+
+def silu(x):
+    return F.sigmoid(x) + .1*x
 
 
 def segsum(x: Tensor, device: Device = None) -> Tensor:
@@ -283,24 +320,3 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
     Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
 
     return Y, final_state
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, d: int, eps: float = 1e-5, device: Device = None):
-        """Gated Root Mean Square Layer Normalization
-
-        Paper: https://arxiv.org/abs/1910.07467
-        """
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d, device=device))
-
-    def forward(self, x, z=None):
-        if z is not None:
-            x = x * normal(z)
-        return x # * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
-
-def normal(x):
-    return x * torch.sigmoid(x)
-    # d = torch.distributions.Normal(torch.zeros_like(x), torch.ones_like(x))
-    # return torch.exp(d.log_prob(x))

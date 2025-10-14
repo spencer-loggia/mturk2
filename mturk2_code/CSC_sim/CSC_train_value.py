@@ -17,18 +17,18 @@ import matplotlib
 from matplotlib import pyplot as plt
 matplotlib.use('TkAgg')
 
-# ----------------------------- Hyper‑parameters -----------------------------
+# ----------------------------- Hyper-parameters -----------------------------
 BATCH_SIZE     = 10         # parallel environments
 EPOCHS         = 3000
 EVAL_INTERVAL  = 500         # render every N epochs
-CHUNK_SIZE     = 64          # SSM chunk size
-DIMS           = 1
-MAX_TRIALS     = CHUNK_SIZE * 5
+CHUNK_SIZE     = 256          # SSM chunk size
+DIMS           = 2
+MAX_TRIALS     = CHUNK_SIZE * 4
 GAMMA          = 0.0         # discount for TD target
 ALPHA_ENTROPY  = 0.01        # entropy bonus coefficient
 LR             = 1e-2
-N_UNITS        = 4
-HEAD_DIM       = 4
+N_UNITS        = 9
+HEAD_DIM       = 9
 NUM_CHOICES    = 1
 DEVICE         = "cpu" # torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SEED_OVERRIDE = None
@@ -40,7 +40,7 @@ agent_config = AgentConfig(
     d_state=1,
     d_conv=2,
     expand=1,
-    percept_dim=2,
+    percept_dim=2 * DIMS,
     reward_dim= 1,
     action_dims=(1,),
     device="cpu",
@@ -69,7 +69,7 @@ def build_value_obs(obs_a: np.ndarray, prev_r: torch.Tensor) -> torch.Tensor:
     return torch.cat([feat, r], dim=1)                           # B*k,5
 
 
-def _collapse_agent_cache(cache, B, action):
+def collapse_agent_cache(cache, B, action):
     """
     Collapse cached states to value that was actually measured
     goes from have leading dims of batch * k -> batch
@@ -83,7 +83,7 @@ def _collapse_agent_cache(cache, B, action):
     return cache
 
 
-def _expand_agent_cache(cache, B, k):
+def expand_agent_cache(cache, B, k):
     """
     goes from have leading dims of batch * k -> batch
     """
@@ -96,8 +96,44 @@ def _expand_agent_cache(cache, B, k):
         cache.ssm_state = s.contiguous()
     return cache
 
+
 # ---------------------------------------------------------------------------
-# Roll‑out to collect trajectories for Q‑learning
+# Shared policy forward utilities (eliminates duplicate logic)
+# ---------------------------------------------------------------------------
+
+def _policy_inputs(obs_a, prev_r):
+    """Return (flat_inputs, reshaped_inputs, B, k, feat_dim)."""
+    # obs_a: (B,k,2) ndarray; prev_r: (B,) tensor
+    flat_inp = build_value_obs(obs_a, prev_r)   # (B*k, feat)
+    Bk, feat = flat_inp.shape
+    # recover B, k from obs_a
+    B, k, _ = obs_a.shape
+    reshaped = flat_inp.view(B, k, feat)        # (B,k,feat)
+    return flat_inp, reshaped, B, k, feat
+
+
+def _apply_deform_inplace(flat_inp: torch.Tensor, deformer: Deform, add_noise: bool):
+    """Mutates percept columns in `flat_inp` via learned deformer (+ optional noise)."""
+    percept = deformer(flat_inp[:, :agent_config.percept_dim])
+    if add_noise:
+        percept = percept + torch.normal(mean=0., std=.1, size=percept.shape, device=percept.device)
+    flat_inp[:, :agent_config.percept_dim] = percept
+    return flat_inp
+
+
+def _forward_and_sample(agent: QAgent, flat_inp: torch.Tensor, B: int, k: int):
+    """Expand cache, forward agent, return logits(B,k) and sampled action(B,)."""
+    agent.cache = expand_agent_cache(agent.cache, B, k)
+    # agent expects (T,B*k,feat); here T=1
+    q, logits = agent(flat_inp.unsqueeze(0), k=k)   # (1,B,k) logits
+    logits = logits.squeeze(0)                      # (B,k)
+    dist = Categorical(logits=logits)
+    act = dist.sample()                              # (B,)
+    return logits, act
+
+
+# ---------------------------------------------------------------------------
+# Roll-out to collect trajectories for Q-learning
 # ---------------------------------------------------------------------------
 
 def collect_batch_q(vec, agent: QAgent, deformer: Deform):
@@ -105,9 +141,9 @@ def collect_batch_q(vec, agent: QAgent, deformer: Deform):
 
     Returns
     -------
-    q_pred   : (T,B)  – predicted Q for the *chosen* action
-    rewards  : (T,B)  – actual rewards (t aligned with q_pred)
-    entropy  : scalar – mean policy entropy (for bonus)
+    obs_seq  : (T,B, 2*DIMS+1)  – per-step features for the chosen action
+    rewards  : (T,B)            – actual rewards (t aligned with obs_seq)
+    entropy  : scalar           – mean policy entropy (unused here, kept API)
     """
     B   = vec.num_envs
     k   = NUM_CHOICES
@@ -126,36 +162,27 @@ def collect_batch_q(vec, agent: QAgent, deformer: Deform):
     # --------------- rollout ---------------
     with torch.no_grad():
         for t in range(T):
-            # deform obs by the perceptual deformation
-            inp = build_value_obs(obs_a, prev_r)           # (B*k,D*2 + 1)
-            percept = deformer(inp[:, :agent_config.percept_dim]) # apply deform
+            flat_inp, reshaped_inp, B_now, k_now, feat = _policy_inputs(obs_a, prev_r)
+            _apply_deform_inplace(flat_inp, deformer, add_noise=True)  # noise ONLY in training rollout
+            logits, act = _forward_and_sample(agent, flat_inp, B_now, k_now)
 
-            # We apply noise because this grounds the perceptual units.
-            percept = percept + torch.normal(mean=0., std=.1, size=percept.shape, device=percept.device)
-
-
-            inp[:, :agent_config.percept_dim] = percept
-            agent.cache = _expand_agent_cache(agent.cache, B, k)
-            q, logits = agent(inp.unsqueeze(0), k=k)       # (1,B,k)
-            logits = logits.squeeze(0)                     # (B,k)
-
-            dist = Categorical(logits=logits)
-            act = dist.sample()                            # (B,)
             actions[t] = act
-            # remember actually selected action
-            obs_seq[t] = inp.reshape(B, k, 2 * DIMS + 1)[np.arange(B), act, :]
+            # record realized (chosen) per-option features
+            obs_seq[t] = reshaped_inp[torch.arange(B_now), act, :]
 
+            # env step
             obs_a, r, _, _, _ = vec.step(act.cpu().numpy())
 
-            # by default the agent save a cache with BATCH indexes, but we want to collapse to the index of the
-            # item we actually chose:
-            agent.cache = _collapse_agent_cache(agent.cache, B, act)
+            # collapse cache to chosen action index
+            agent.cache = collapse_agent_cache(agent.cache, B_now, act)
 
             rewards[t + 1] = torch.from_numpy(r).to(DEVICE)  # align +1
             prev_r = rewards[t + 1]
+
     # --------------- prepare for backward pass ---------------
     agent.reset(); agent.sequential = False
-    return obs_seq, rewards[1:].float(), 0.
+    return obs_seq, rewards[1:].float(), 0.0
+
 
 # ---------------------------------------------------------------------------
 # Evaluation episode (greedy policy, rendered)
@@ -183,23 +210,24 @@ def play_once(agent: QAgent, deformer: Deform, *, trials: int, disp_steps: int =
         if (step + 1) % disp_steps == 0:
             env.render_reward = render; env.render_flag = render
 
-        inp = build_value_obs(obs_a[np.newaxis, ...], prev_r)  # (k,5)
-        percept = deformer(inp[:, :agent_config.percept_dim])
-        inp[:, :agent_config.percept_dim] = percept
-        inp = inp.unsqueeze(0)
-        agent.cache = _expand_agent_cache(agent.cache, 1, env.k)
+        # reshape obs_a to (B=1,k,2)
+        obs_batch = obs_a[np.newaxis, ...]
+        flat_inp, reshaped_inp, B_now, k_now, feat = _policy_inputs(obs_batch, prev_r)
+
+        # NO noise during evaluation/visualization
+        _apply_deform_inplace(flat_inp, deformer, add_noise=False)
+
         with torch.no_grad():
-            _, logits = agent(inp, k=env.k)                                 # (1,1,k)
-        logits = logits.squeeze(0)                     # (B,k)
-        dist = Categorical(logits=logits)
-        action = dist.sample()  # (B,)
+            logits, action = _forward_and_sample(agent, flat_inp, B_now, k_now)
+
+        # capture chosen hidden state exactly as before
         states.append(agent.hidden[action])
 
+        # step env (single env expects int/np scalar ok)
         obs_a, r, done, _, _ = env.step(action)
 
-        # by default the agent save a cache with BATCH indexes, but we want to collapse to the index of the
-        # item we actually chose:
-        agent.cache = _collapse_agent_cache(agent.cache, 1, action)
+        # collapse cache to chosen action index
+        agent.cache = collapse_agent_cache(agent.cache, 1, action)
 
         prev_r = torch.tensor(r, device=DEVICE).unsqueeze(0)
         total_r += r; step += 1
@@ -214,6 +242,7 @@ def play_once(agent: QAgent, deformer: Deform, *, trials: int, disp_steps: int =
     print(f"Last 100 Average R: {L100}")
     return torch.concatenate(states, dim=0).detach().cpu()
 
+
 # ---------------------------------------------------------------------------
 # Training loop – TD(0) + entropy bonus
 # ---------------------------------------------------------------------------
@@ -222,7 +251,7 @@ def train():
     env_proto = CSC2Env(k=NUM_CHOICES)
     k = env_proto.k
 
-    obs_dim = 2 * DIMS + 1                            # per‑option features
+    obs_dim = 2 * DIMS + 1                            # per-option features
     # if SELF_ACTION:
     #     obs_dim = obs_dim + DIMS
 
@@ -258,9 +287,9 @@ def train():
         keys = random.sample(list(storage), min(len(storage), 5 * BATCH_SIZE))
         r_obs = [obs_seq]
         r_rewards = [rewards]
-        for k in keys:
-            r_obs.append(storage[k][0])
-            r_rewards.append(storage[k][1])
+        for k_ in keys:
+            r_obs.append(storage[k_][0])
+            r_rewards.append(storage[k_][1])
         r_obs = torch.concatenate(r_obs, dim=1)
         r_rewards = torch.concatenate(r_rewards, dim=1)
 
@@ -280,7 +309,7 @@ def train():
         # prune storage to size
         keys = random.sample(list(storage), max(0, len(storage) - 20 * BATCH_SIZE))
         # pop and collect
-        storage = {k: storage.pop(k) for k in keys}
+        storage = {k_: storage.pop(k_) for k_ in keys}
         # add new storage
         for b in range(BATCH_SIZE):
             storage[str(epoch) + str(b)] = (obs_seq[:, b:(b+1), ...].detach(), rewards[:, b:(b+1)].detach())
