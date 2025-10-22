@@ -33,8 +33,9 @@ def train_behavior(csv_paths, tau: float = 1.0):
     for epoch in range(1, EPOCHS + 1):
         # --------- Build per-time, per-option features and run SSM in parallel ---------
         TB = T * B
-        oa_tbk2 = angles_tbk2.reshape(TB, k, 2)             # (TB,k,2)
-        pr_tb   = prev_r_tb.reshape(TB)                      # (TB,)
+        to_select = torch.randint(0, B, size=(2,))
+        oa_tbk2 = angles_tbk2[:, to_select, :].reshape(TB, k, 2)             # (TB,k,2)
+        pr_tb   = prev_r_tb[:, to_select].reshape(TB)                      # (TB,)
         x = build_value_obs(oa_tbk2, pr_tb)                  # (TB*k, 2*DIMS+1)
 
         # Perceptual deformation (+ training-time noise to ground units)
@@ -48,7 +49,7 @@ def train_behavior(csv_paths, tau: float = 1.0):
 
         # --------- Behavior loss: CE(onehot(choice), softmax(tau * V)) ---------
         logits = (tau * q_all).reshape(T * B, k)
-        target = target_tb.reshape(T * B)
+        target = target_tb[:, to_select].reshape(T * B)
         ce_loss = F.cross_entropy(logits, target)
         loss = ce_loss + deform.compute_penalty()
 

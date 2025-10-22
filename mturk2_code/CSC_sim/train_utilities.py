@@ -72,10 +72,14 @@ def _forward_and_sample(agent: QAgent, flat_inp: torch.Tensor, prev_r, B: int, k
 # ============================== Rollout (Q) ==================================
 
 @torch.no_grad()
-def collect_batch_q(vec, agent: QAgent, deformer: Deform, cfg: TrainConfig):
+def collect_batch_q(vec, agent: QAgent, deformer: Deform, cfg: TrainConfig, dev="cpu"):
     """One full episode (T=cfg.max_trials) across vector env."""
     B, k, T = vec.num_envs, cfg.num_choices, cfg.max_trials
     obs_a, _ = vec.reset()
+    pd = cfg.device
+    cfg.device = dev
+    agent = agent.to(dev)
+    deformer = deformer.to(dev)
     prev_r = torch.zeros(B, device=cfg.device)
     actions = torch.empty(T, B, dtype=torch.long, device=cfg.device)
     rewards = torch.zeros(T + 1, B, device=cfg.device)
@@ -90,13 +94,21 @@ def collect_batch_q(vec, agent: QAgent, deformer: Deform, cfg: TrainConfig):
         obs_a, r, _, _, _ = vec.step(act.cpu().numpy())
         agent.cache = collapse_agent_cache(agent.cache, k, act)
         rewards[t + 1] = torch.from_numpy(r).to(cfg.device); prev_r = rewards[t + 1]
-    agent.reset(); agent.sequential = False
-    return obs_seq, rewards.float(), 0.0
+    cfg.device = pd
+    agent = agent.to(pd)
+    deformer = deformer.to(pd)
+    agent.reset()
+    agent.sequential = False
+    return obs_seq.to(cfg.device), rewards.float().to(cfg.device), 0.0
 
 # ============================== Evaluation ===================================
 
 def play_once(agent: QAgent, deformer: Deform, cfg: TrainConfig, *, trials: int, disp_steps: int = 30,
               render=True, seed=None, k=None):
+    pd = cfg.device
+    cfg.device = "cpu"
+    agent = agent.to("cpu")
+    deformer = deformer.to("cpu")
     if cfg.seed_override is not None: seed = cfg.seed_override
     if k is None: k = agent.n_actions
     n = 72 if cfg.dims == 1 else 36
@@ -108,7 +120,7 @@ def play_once(agent: QAgent, deformer: Deform, cfg: TrainConfig, *, trials: int,
     while True:
         if (step + 1) % disp_steps == 0: env.render_reward = env.render_flag = render
         flat = build_value_obs(obs_a[np.newaxis, ...], cfg)
-        apply_deform_inplace(flat, deformer, cfg, add_noise=False)
+        flat = apply_deform_inplace(flat, deformer, cfg, add_noise=False)
         with torch.no_grad():
             _, action = _forward_and_sample(agent, flat, prev_r, 1, k)
         states.append(agent.hidden[action])
@@ -121,6 +133,9 @@ def play_once(agent: QAgent, deformer: Deform, cfg: TrainConfig, *, trials: int,
     L100 = np.stack(ret_hist[-100:]).mean() if len(ret_hist) >= 100 else np.mean(ret_hist)
     env.close()
     print(f"Rendered episode total return: {total_r}\nLast 100 Average R: {L100:.3f}")
+    cfg.device = pd
+    agent = agent.to(pd)
+    deformer = deformer.to(pd)
     return torch.concatenate(states, dim=0).detach().cpu()
 
 # ============================== Saving utils =================================

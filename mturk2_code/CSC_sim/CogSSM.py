@@ -35,9 +35,7 @@ class SSMConfig:
 
 # --------------- cache ------------------
 class InferenceCache:
-    # (batch, d_inner + d_state, d_conv)  # CHANGED (was d_inner + 2*d_state)
     conv_state: Tensor
-    # (batch, nheads, headdim, d_state)
     ssm_state: Tensor
 
     def __init__(self, conv_state: Tensor, ssm_state: Tensor):
@@ -48,7 +46,7 @@ class InferenceCache:
     def alloc(batch_size: int, args: SSMConfig, device: Device = None):
         return InferenceCache(
             torch.zeros(
-                batch_size, args.d_inner + args.d_state, args.d_conv, device=device
+                batch_size, args.d_inner + 2 * args.d_state, args.d_conv, device=device
             ),
             torch.zeros(
                 batch_size, args.nheads, args.headdim, args.d_state, device=device
@@ -59,6 +57,12 @@ class InferenceCache:
         import copy
         return copy.deepcopy(self)
 
+    # NEW: move cache tensors
+    def to(self, device: Device, dtype: torch.dtype | None = None, non_blocking: bool = False):
+        self.conv_state = self.conv_state.to(device=device, dtype=dtype, non_blocking=non_blocking)
+        self.ssm_state  = self.ssm_state.to(device=device, dtype=dtype, non_blocking=non_blocking)
+        return self
+
 
 # --------------- model ------------------
 class SSM(nn.Module):
@@ -67,12 +71,12 @@ class SSM(nn.Module):
         self.args = args
         self.device = device
 
-        # in-proj now produces: z (d_inner), xC preconv (d_inner + d_state), dt (nheads)
-        d_in_proj = 2 * args.d_inner + 1 * args.d_state + args.nheads
+        # in-proj now produces: z (d_inner), xBC preconv (d_inner + d_state), dt (nheads)
+        d_in_proj = 2 * args.d_inner + 2 * args.d_state + args.nheads
         self.in_proj = nn.Linear(args.input_dim, d_in_proj, bias=True, device=device)
 
-        # depthwise conv over xC only
-        self.conv_dim = args.d_inner + args.d_state
+        # depthwise conv over xBC only
+        self.conv_dim = args.d_inner + 2 * args.d_state
         self.conv1d = nn.Conv1d(
             in_channels=self.conv_dim,
             out_channels=self.conv_dim,
@@ -84,9 +88,10 @@ class SSM(nn.Module):
 
         # B is linear in reward ONLY
         self.B_proj = nn.Linear(args.reward_dim, args.d_state, bias=True, device=device)
-
+        #self.alpha = torch.nn.Parameter(torch.tensor([0.], device=device))
         self.dt_bias = nn.Parameter(torch.zeros(args.nheads, device=device))
-        self.A_log = torch.zeros(args.nheads, device=device)
+        self.dt = nn.Parameter(torch.zeros(args.nheads, device=device))
+        self.A_log = nn.Parameter(torch.tensor([-2.], device=device))
         self.D = nn.Parameter(torch.ones(args.nheads, device=device))
         self.norm = RMSNorm(args.d_inner, device=device)
         self.out_proj = nn.Linear(args.d_inner, args.output_dim, bias=False, device=device)
@@ -103,28 +108,29 @@ class SSM(nn.Module):
             B:  (b, l, state_dim)
         """
         zxc_dt = self.in_proj(u)  # (b, l, 2*d_inner + d_state + nheads)
-        z, xC, dt = torch.split(
+        z, xBC, dt = torch.split(
             zxc_dt,
             [self.args.d_inner, self.conv_dim, self.args.nheads],
             dim=-1,
         )
-        dt = F.softplus(dt + self.dt_bias)
+        dt = F.softplus(self.dt + self.dt_bias)
+        dt = torch.tile(dt[None, None, :], (z.shape[0], z.shape[1], 1))
 
         # compute B from reward only
         l = reward.shape[1]
-        B = self.B_proj(rearrange(reward, "b l 1 -> (b l) 1"))                   # (b, l, d_state)
-        B = rearrange(B, "(b l) s -> b l s", l=l)
-
-        return z, xC, dt, B
+        R = self.B_proj(rearrange(reward, "b l 1 -> (b l) 1"))                   # (b, l, d_state)
+        R = rearrange(R, "(b l) s -> b l s", l=l)
+        x = xBC[..., :self.args.d_inner]
+        return z, xBC, dt, R
 
     def _conv_and_split(
-        self, xC: Tensor, h: InferenceCache | None
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        self, xBC: Tensor, h: InferenceCache | None
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Depthwise conv over xC, split into x and C.
 
         Args:
-            xC: (b, l, d_inner + d_state)
+            xBC: (b, l, d_inner + 2 * d_state)
             h : None (full) or cache (step, l==1)
 
         Returns:
@@ -133,25 +139,26 @@ class SSM(nn.Module):
             conv_state: (b, d_inner + d_state, d_conv)
         """
         if h is None:
-            l = xC.shape[1]
-            xC_conv = silu(self.conv1d(xC.transpose(1, 2)).transpose(1, 2))[:, :l, :]
-            conv_state = F.pad(rearrange(xC, "b l d -> b d l"), (self.args.d_conv - l, 0))
+            l = xBC.shape[1]
+            xBC_conv = silu(self.conv1d(xBC.transpose(1, 2)).transpose(1, 2))[:, :l, :]
+            conv_state = F.pad(rearrange(xBC, "b l d -> b d l"), (self.args.d_conv - l, 0))
         else:
-            assert xC.shape[1] == 1, "Step mode expects seqlen=1"
-            xC_last = xC.squeeze(1)  # (b, conv_dim)
+            assert xBC.shape[1] == 1, "Step mode expects seqlen=1"
+            xBC_last = xBC.squeeze(1)  # (b, conv_dim)
             # roll buffer and insert
             h.conv_state.copy_(torch.roll(h.conv_state, shifts=-1, dims=-1))
-            h.conv_state[:, :, -1] = xC_last
+            h.conv_state[:, :, -1] = xBC_last
             # depthwise conv
             weight_dw = rearrange(self.conv1d.weight, "d 1 w -> d w")
-            xC_conv = torch.sum(h.conv_state * weight_dw, dim=-1)
-            xC_conv = xC_conv + self.conv1d.bias
-            xC_conv = silu(xC_conv).unsqueeze(1)
+            xBC_conv = torch.sum(h.conv_state * weight_dw, dim=-1)
+            xBC_conv = xBC_conv + self.conv1d.bias
+            xBC_conv = silu(xBC_conv).unsqueeze(1)
             conv_state = h.conv_state
 
-        x, C = torch.split(xC_conv, [self.args.d_inner, self.args.d_state], dim=-1)
-        C = torch.ones_like(C)
-        return x, C, conv_state
+        x, B, C = torch.split(xBC_conv, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1)
+        # x = -1 * torch.nn.functional.softplus(self.alpha) * x
+        # C = torch.ones_like(C)
+        return -1 * x, B, C, conv_state
 
     # ---- Public API ---------------------------------------------------------
 
@@ -163,13 +170,32 @@ class SSM(nn.Module):
             y: (batch, seqlen, output_dim)
             h: InferenceCache
         """
-        if h is not None:
+        bs = u.shape[0]
+        seqlen = u.shape[1]
+        if seqlen != reward.shape[1] or bs != reward.shape[0]:
+            raise ValueError
+
+        if seqlen == 1:
+            # running in sequential mode
+            # initial cache if None:
+            if h is None:
+                print("Initializing empty cache...")
+                h = InferenceCache.alloc(batch_size=bs, args=self.config, device=self.config.device)
             return self.step(u, reward, h)
 
+        if h is not None:
+            if h.conv_state.count_nonzero() > 0:
+                print("WARN: Cannot initialize parallel step with nonzero conv state. Conv staste will be discarded.")
+            ssd_initial_state = h.ssm_state.clone()
+        else:
+            ssd_initial_state = None
         # projections
         A = -torch.exp(self.A_log)                # (nheads,)
-        z, xC, dt, B = self._project(u, reward)              # (b,l,d_inner), (b,l,conv_dim), (b,l,nheads)
-        x, C, conv_state = self._conv_and_split(xC, h=None)
+        #A = A + torch.eye(self.args.d_state, device=self.device) * torch.nn.functional.softplus(self.alpha)
+        z, xBC, dt, R = self._project(u, reward)              # (b,l,d_inner), (b,l,conv_dim), (b,l,nheads)
+        dt = torch.ones_like(dt)
+        x, B, C, conv_state = self._conv_and_split(xBC, h=None)
+        B = B * R  # scale by reward projection
         # SSD
         x_heads = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
         y, ssm_state = ssd(
@@ -178,6 +204,7 @@ class SSM(nn.Module):
             rearrange(B, "b l n -> b l 1 n"),     # broadcast over heads
             rearrange(C, "b l n -> b l 1 n"),
             self.args.chunk_size,
+            initial_states=ssd_initial_state,
             device=self.device,
         )
         y = rearrange(y, "b l h p -> b l (h p)")
@@ -203,18 +230,21 @@ class SSM(nn.Module):
             h.ssm_state = torch.tile(h.ssm_state, (bs, 1, 1, 1))
 
         # shared projections
-        z, xC, dt, B = self._project(u, reward)             # (b,1,·)
-        x, C, _ = self._conv_and_split(xC, h)
+        z, xBC, dt, R = self._project(u, reward)             # (b,1,·)
+        x, B, C, _ = self._conv_and_split(xBC, h)
 
         # B from reward only
-        B = self.B_proj(reward).squeeze(1)       # (b, d_state)
-
+        R = self.B_proj(reward).squeeze(1)       # (b, d_state)
+        B = B * R.unsqueeze(-1)
         # scalar SSM update
         A = -torch.exp(self.A_log)
+        #A = A + torch.eye(self.args.d_state, device=self.device) * torch.nn.functional.softplus(self.alpha)
+        dt = torch.ones_like(dt)
         dt = dt.squeeze(1)                       # (b, nheads)
         dA = torch.exp(dt * A)
         x = rearrange(x.squeeze(1), "b (h p) -> b h p", p=self.args.headdim)
         C = C.squeeze(1)                         # (b, d_state)
+        B = B.squeeze(1)
 
         dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
         h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
@@ -224,6 +254,34 @@ class SSM(nn.Module):
         y = self.out_proj(y)
 
         return y.unsqueeze(1), h
+
+    def to(self, *args, **kwargs):
+        """
+        Mirrors nn.Module.to(...), but also:
+          - moves non-parameter tensor `A_log`
+          - updates self.device
+        Returns self (like nn.Module.to).
+        """
+        # Let nn.Module move all registered parameters/buffers first
+        ret = super().to(*args, **kwargs)
+
+        # Parse device / dtype from args/kwargs (matches torch API behavior)
+        device = kwargs.get("device", None)
+        dtype  = kwargs.get("dtype",  None)
+
+        if device is None and len(args) >= 1 and not isinstance(args[0], torch.dtype):
+            device = args[0]
+        if dtype is None and len(args) >= 1 and isinstance(args[0], torch.dtype):
+            dtype = args[0]
+
+        # Move non-parameter attributes that aren't registered as buffers
+        #self.A_log = self.A_log.to(device=device, dtype=dtype)
+
+        # Keep a record of the current device
+        if device is not None:
+            self.device = device
+
+        return ret
 
 
 # --------- utilities (unchanged) ----------
@@ -240,7 +298,7 @@ class RMSNorm(nn.Module):
 
 
 def silu(x):
-    return F.sigmoid(x) + .1*x
+    return torch.nn.functional.softplus(x)
 
 
 def segsum(x: Tensor, device: Device = None) -> Tensor:
@@ -306,7 +364,7 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
     # (middle term of factorization of off-diag blocks; A terms)
     if initial_states is None:
         initial_states = torch.zeros_like(states[:, :1])
-    states = torch.cat([initial_states, states], dim=1)
+    states = torch.cat([initial_states.unsqueeze(1), states], dim=1)
     decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0)), device=device))
     new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
     states, final_state = new_states[:, :-1], new_states[:, -1]

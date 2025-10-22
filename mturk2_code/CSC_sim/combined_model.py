@@ -45,6 +45,7 @@ class Deform(nn.Module):
         sobol_scramble: bool = True,
         margin_sigma_min: float = 1e-2,   # penalize if smallest singular value < margin
         groups: int = 1,
+        device="cpu"
     ):
         super().__init__()
         self.activ = nn.Tanh()
@@ -62,9 +63,10 @@ class Deform(nn.Module):
         if self.channels % self.groups != 0:
             raise ValueError(f"channels ({self.channels}) must be divisible by groups ({self.groups})")
         self.group_size = self.channels // self.groups
+        self.device = device
 
         # Register the domain as buffers so dtype/device track the module
-        box = torch.as_tensor(box, dtype=torch.float32)
+        box = torch.as_tensor(box, dtype=torch.float32, device=self.device)
         domain = torch.stack([box for _ in range(self.channels)], dim=0)  # (C, 2)
         self.register_buffer("domain", domain, persistent=False)  # (channels, 2)
 
@@ -74,8 +76,8 @@ class Deform(nn.Module):
 
         # Parameters: either a single pair of Linear layers, or one pair per group
         if self.groups == 1:
-            self.project  = nn.Linear(self.channels, self.deform_basis, bias=False)  # W1: (B, C)
-            self.collapse = nn.Linear(self.deform_basis, self.channels, bias=False)  # W2: (C, B)
+            self.project  = nn.Linear(self.channels, self.deform_basis, bias=False, device=device)  # W1: (B, C)
+            self.collapse = nn.Linear(self.deform_basis, self.channels, bias=False, device=device)  # W2: (C, B)
             # Small, stable init keeps Jacobian near I initially
             nn.init.kaiming_uniform_(self.project.weight, a=5**0.5)
             nn.init.kaiming_uniform_(self.collapse.weight, a=5**0.5)
@@ -84,11 +86,11 @@ class Deform(nn.Module):
                 self.collapse.weight.mul_(0.2)
         else:
             self.project = nn.ModuleList([
-                nn.Linear(self.group_size, self.deform_basis, bias=False)
+                nn.Linear(self.group_size, self.deform_basis, bias=False, device=device)
                 for _ in range(self.groups)
             ])
             self.collapse = nn.ModuleList([
-                nn.Linear(self.deform_basis, self.group_size, bias=False)
+                nn.Linear(self.deform_basis, self.group_size, bias=False, device=device)
                 for _ in range(self.groups)
             ])
             for p, c in zip(self.project, self.collapse):
@@ -103,7 +105,7 @@ class Deform(nn.Module):
             # Create per-device engine; store dimension to detect changes
             self._sobol_dimension = self.channels
             self._sobol = torch.quasirandom.SobolEngine(
-                dimension=self.channels, scramble=self.sobol_scramble
+                dimension=self.channels, scramble=self.sobol_scramble,
             )
         # SobolEngine only returns float32 CPU; we’ll cast after draw.
         return self._sobol
@@ -130,7 +132,7 @@ class Deform(nn.Module):
         # Draw Sobol samples in [0,1]^C then affine map to the domain per-dim
         se = self._sobol_engine(device, dtype)
         u01 = se.draw(n)  # (n, C), float32 on CPU
-        u01 = u01.to(device=device, dtype=dtype)
+        u01 = u01.to(device=self.device, dtype=dtype)
         lo, hi = self.domain[:, 0], self.domain[:, 1]          # (C,), (C,)
         return u01 * (hi - lo).unsqueeze(0) + lo.unsqueeze(0)  # (n, C)
 
@@ -150,11 +152,10 @@ class Deform(nn.Module):
 
 
         # Device/dtype from params
+        device = self.device
         if self.groups == 1:
-            device = self.project.weight.device
             dtype = self.project.weight.dtype
         else:
-            device = self.project[0].weight.device
             dtype = self.project[0].weight.dtype
 
         C = self.channels
@@ -207,6 +208,30 @@ class Deform(nn.Module):
         cost = torch.nn.functional.softplus(self.margin_sigma_min - smin).mean()
         return self.reg_weight * cost
 
+    def to(self, *args, **kwargs):
+        """
+        Move module params/buffers and update self.device.
+        Also resets the Sobol engine so it can be lazily recreated on the new device.
+        """
+        ret = super().to(*args, **kwargs)
+
+        # Parse torch's flexible .to(...) signature
+        device = kwargs.get("device", None)
+        dtype = kwargs.get("dtype", None)
+        if device is None and len(args) >= 1 and not isinstance(args[0], torch.dtype):
+            device = args[0]
+        if dtype is None and len(args) >= 1 and isinstance(args[0], torch.dtype):
+            dtype = args[0]
+
+        if device is not None:
+            self.device = torch.device(device)
+
+        # SobolEngine lives on CPU and we cast samples afterward; safest to recreate after a move
+        self._sobol = None
+        self._sobol_dimension = None
+
+        return ret
+
 # ---------------------------------------------------------------------------
 # Model: Q‑value network with internal SSM state + temperature scaling
 # ---------------------------------------------------------------------------
@@ -224,8 +249,9 @@ class QAgent(torch.nn.Module):
         self.obs_dim = config.obs_dim
         self.config = config
         self.ssm = SSM(config, device=config.device)
-        # temperature parameter (log parameterization for positivity)
-        self.log_tau = nn.Parameter(torch.zeros((1), device=config.device))
+        initial_vals = torch.empty((config.nheads, config.headdim,  config.d_state),
+                                   dtype=torch.float32, device=config.device)
+        self.initial_states = torch.nn.Parameter(torch.nn.init.kaiming_uniform_(initial_vals * .1))
         # self.sa = torch.tensor([0.], device=config.device)
         # self.sa_net = torch.nn.Linear(in_features=self.ssm.args.d_inner * self.ssm.args.d_state, out_features=config)
         self.hidden = None  # b, p, h, s
@@ -240,29 +266,58 @@ class QAgent(torch.nn.Module):
         T, Bk, _ = obs.shape
 
         # if operating with self action need to add action to network.
-        if self.sequential and self.cache is None:
-            self.cache = InferenceCache.alloc(batch_size=Bk, args=self.config, device=self.config.device)
-        if self.sequential:
-            h = self.cache
-        else:
-            h = None
+        if self.cache is None:
+            # start from the top
+            cache = InferenceCache.alloc(batch_size=Bk, args=self.config, device=self.config.device)
+            cache.ssm_state = cache.ssm_state + self.initial_states.unsqueeze(0)
+            self.cache = cache
+
         x = obs.float().view(T * Bk, -1)  # (T*Bk,input_dim)
         rew = reward.float().view(T * Bk, 1)  # (T*Bk,input_dim)
         x = rearrange(x, '(t b) s -> t b s', t=T, b=Bk)  # (T,Bk,N_UNITS)
         rew = rearrange(rew, '(t b) 1 -> t b 1', b=Bk)
 
-        y, self.cache = self.ssm(x.transpose(0, 1), rew.transpose(0, 1), h)  # (T,Bk,N_UNITS)
+        y, self.cache = self.ssm(x.transpose(0, 1), rew.transpose(0, 1), self.cache)  # (T,Bk,N_UNITS)
         self.hidden = self.cache.ssm_state.clone()
         y = y.transpose(0, 1)
 
         q = y  # (T,Bk)
         q = q.view(T, -1, k)  # (T,B,k)
 
-        tau = torch.exp(self.log_tau)
-        logits = q / tau
+        logits = q
         return q, logits
 
     # ---------------------------------------------------------------------
     def reset(self):
         self.sequential = False
         self.cache = None
+
+    def to(self, *args, **kwargs):
+        """
+        Move the agent, its SSM, and (if present) the inference cache.
+        Also keeps AgentConfig.device in sync.
+        """
+        ret = super().to(*args, **kwargs)
+
+        # Parse torch's flexible .to(...) signature
+        device = kwargs.get("device", None)
+        dtype = kwargs.get("dtype", None)
+        if device is None and len(args) >= 1 and not isinstance(args[0], torch.dtype):
+            device = args[0]
+        if dtype is None and len(args) >= 1 and isinstance(args[0], torch.dtype):
+            dtype = args[0]
+
+        if device is not None:
+            # keep config + internal flags consistent
+            dev = torch.device(device)
+            self.config.device = str(dev)
+            self.ssm = self.ssm.to(device)
+            # if there's a live cache, move it too
+            if self.cache is not None:
+                # InferenceCache in your project already has .to(...) from earlier
+                # If not, you can manually move tensors:
+                #   self.cache.conv_state = self.cache.conv_state.to(dev, dtype=dtype)
+                #   self.cache.ssm_state  = self.cache.ssm_state.to(dev, dtype=dtype)
+                self.cache = self.cache.to(dev, dtype=dtype)
+
+        return ret
